@@ -48,6 +48,9 @@ handle, removing the controller from XInput. The HID root node and ownership
 record can remain until the next successful `create`, which removes only
 the client's recorded root identity. Changed ownership/configuration causes
 an error and is preserved.
+The actual companion ID is recorded separately under
+`HKLM\SOFTWARE\HIDMaestroRustClient\Controller0`; this journal is removed
+after successful cleanup. Do not edit either ownership record.
 
 ## Build and checks
 

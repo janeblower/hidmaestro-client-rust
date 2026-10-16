@@ -22,9 +22,11 @@ use windows_sys::{
 };
 
 const CONFIG: &str = r"SOFTWARE\HIDMaestro\Controller0";
+const JOURNAL: &str = r"SOFTWARE\HIDMaestroRustClient\Controller0";
 const OWNER: &str = "hidmaestro-client-rust/v1/xbox360";
 const SWD_HARDWARE: &str = "root\\VID_045E&PID_028E&XI_00\0root\\HIDMaestroXUSB\0";
 const ROOT_ID: &str = r"ROOT\VID_045E&PID_028E&IG_00\HM_RUST_CLIENT_0";
+#[cfg(test)]
 const SWD_ID: &str = r"SWD\HIDMAESTRO\HM_RUST_CLIENT_0";
 const HARDWARE: &str =
     "root\\VID_045E&PID_028E&IG_00\0root\\HIDMaestroRustXbox360\0root\\HIDMaestro\0";
@@ -190,6 +192,26 @@ impl Key {
     fn owned(&self) -> Result<bool> {
         Ok(self.get("RustClientOwner")? == Some((REG_SZ, utf16_bytes(OWNER))))
     }
+
+    fn companion_id(&self) -> Result<Option<String>> {
+        let Some((kind, bytes)) = self.get("CompanionInstanceId")? else {
+            return Ok(None);
+        };
+        if kind != REG_SZ || bytes.len() % 2 != 0 || !bytes.ends_with(&[0, 0]) {
+            return Err(io::Error::other("invalid recorded companion identity"));
+        }
+        let chars: Vec<_> = bytes[..bytes.len() - 2]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
+            .collect();
+        let id = String::from_utf16(&chars).map_err(io::Error::other)?;
+        if id.is_empty() || id.contains('\0') {
+            return Err(io::Error::other("empty recorded companion identity"));
+        }
+        Ok(Some(id))
+    }
 }
 impl Drop for Key {
     fn drop(&mut self) {
@@ -236,6 +258,14 @@ fn configuration() -> BTreeMap<String, (u32, Vec<u8>)> {
 fn wait_mappings() -> Result<()> {
     wait_for(
         || {
+            // XInput caches file handles; observing removal lets this process release them.
+            for slot in 0..4 {
+                let mut state =
+                    windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
+                unsafe {
+                    windows_sys::Win32::UI::Input::XboxController::XInputGetState(slot, &mut state);
+                }
+            }
             for name in ["Input", "Output", "InputAck"] {
                 let handle = unsafe {
                     windows_sys::Win32::System::Memory::OpenFileMappingW(
@@ -431,6 +461,24 @@ fn elevated() -> Result<()> {
 }
 
 fn recover() -> Result<()> {
+    let journal = Key::open(JOURNAL)?;
+    let recorded = if let Some(key) = &journal {
+        if !key.owned()? {
+            return Err(io::Error::other("foreign recovery journal"));
+        }
+        let id = key.companion_id()?;
+        let mut expected =
+            BTreeMap::from([("RustClientOwner".into(), (REG_SZ, utf16_bytes(OWNER)))]);
+        if let Some(id) = &id {
+            expected.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
+        }
+        if key.snapshot()? != expected {
+            return Err(io::Error::other("recovery journal was modified"));
+        }
+        id
+    } else {
+        None
+    };
     if let Some(key) = Key::open(CONFIG)? {
         if !key.owned()? {
             return Err(io::Error::new(
@@ -439,8 +487,8 @@ fn recover() -> Result<()> {
             ));
         }
         let mut expected = configuration();
-        if let Some(value) = key.get("CompanionInstanceId")? {
-            expected.insert("CompanionInstanceId".into(), value);
+        if let Some(id) = &recorded {
+            expected.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
         }
         if key.snapshot()? != expected {
             return Err(io::Error::other(
@@ -448,15 +496,25 @@ fn recover() -> Result<()> {
             ));
         }
         drop(key);
-        if present(SWD_ID) {
+        if recorded.as_deref().is_some_and(present) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "XUSB instance still has an owner",
             ));
         }
         remove_root()?;
+        if let Some(id) = &recorded {
+            remove_node(id, SWD_HARDWARE)?;
+        }
         wait_mappings()?;
         status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(CONFIG).as_ptr()) })?;
+    }
+    if journal.is_some() {
+        if recorded.as_deref().is_some_and(present) {
+            return Err(io::Error::other("recorded companion is still present"));
+        }
+        drop(journal);
+        status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(JOURNAL).as_ptr()) })?;
     }
     Ok(())
 }
@@ -615,6 +673,8 @@ pub(crate) struct Backend {
     config: bool,
     transport: Option<Transport>,
     expected: BTreeMap<String, (u32, Vec<u8>)>,
+    companion_id: Option<String>,
+    journal: bool,
 }
 
 impl Backend {
@@ -632,6 +692,8 @@ impl Backend {
             config: false,
             transport: Some(transport),
             expected: BTreeMap::new(),
+            companion_id: None,
+            journal: false,
         };
         let setup = (|| {
             let mut phantom = 0;
@@ -655,6 +717,10 @@ impl Backend {
                 this.expected.insert(name, (kind, bytes));
             }
             drop(key);
+            let journal = Key::create(JOURNAL)?;
+            this.journal = true;
+            journal.text("RustClientOwner", OWNER)?;
+            drop(journal);
             this.submit(&State::default())?;
             this.create_root(&inf)
                 .map_err(|e| io::Error::new(e.kind(), format!("HID setup: {e}")))?;
@@ -666,6 +732,10 @@ impl Backend {
                     .map_err(|e| io::Error::new(e.kind(), format!("XUSB setup: {e}")))?,
             );
             let id = &this.companion.as_ref().unwrap().id;
+            this.companion_id = Some(id.clone());
+            Key::open(JOURNAL)?
+                .ok_or_else(|| io::Error::other("recovery journal disappeared"))?
+                .text("CompanionInstanceId", id)?;
             Key::open(CONFIG)?
                 .ok_or_else(|| io::Error::other("configuration disappeared"))?
                 .text("CompanionInstanceId", id)?;
@@ -815,7 +885,8 @@ impl Backend {
                 }
             }
         }
-        let lease = if !self.root && !present(SWD_ID) {
+        let companion_gone = self.companion_id.as_deref().is_none_or(|id| !present(id));
+        let lease = if !self.root && companion_gone {
             self.transport.take().map(Transport::release)
         } else {
             None
@@ -825,7 +896,7 @@ impl Backend {
         {
             error.get_or_insert(e);
         }
-        if self.config && !self.root && !present(SWD_ID) && error.is_none() {
+        if self.config && !self.root && companion_gone && error.is_none() {
             let result = (|| {
                 if let Some(key) = Key::open(CONFIG)? {
                     if key.snapshot()? != self.expected {
@@ -840,6 +911,23 @@ impl Backend {
             })();
             match result {
                 Ok(()) => self.config = false,
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        if self.journal
+            && !self.config
+            && !self.root
+            && companion_gone
+            && let Some(key) = Key::open(JOURNAL)?
+        {
+            if !key.owned()? || key.companion_id()? != self.companion_id {
+                return Err(io::Error::other("journal ownership changed; preserving it"));
+            }
+            drop(key);
+            match status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(JOURNAL).as_ptr()) }) {
+                Ok(()) => self.journal = false,
                 Err(e) => {
                     error.get_or_insert(e);
                 }
@@ -872,6 +960,12 @@ mod tests {
         assert!(Key::open(CONFIG).unwrap().is_none());
         let controller = Backend::create_inner(false).unwrap();
         assert!(present(ROOT_ID));
+        for slot in 0..4 {
+            let mut state = windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
+            unsafe {
+                windows_sys::Win32::UI::Input::XboxController::XInputGetState(slot, &mut state);
+            }
+        }
         assert!(Backend::create_inner(false).is_err());
         controller.close().unwrap();
         assert!(!present(ROOT_ID));
@@ -974,5 +1068,31 @@ mod tests {
             status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(CONFIG).as_ptr()) }).unwrap();
         }
         assert!(recovered.is_ok(), "{:#?}", recovered.err());
+    }
+
+    #[test]
+    #[ignore = "explicit elevated recovery test preserves an altered companion ID"]
+    fn modified_companion_record_is_preserved() {
+        let mut old = Backend::create().unwrap();
+        let id = old.companion.as_ref().unwrap().id.clone();
+        old.companion.take();
+        wait_for(|| !present(&id), "XUSB close").unwrap();
+        old.transport.take();
+        old.root = false;
+        old.config = false;
+        drop(old);
+        let key = Key::open(CONFIG).unwrap().unwrap();
+        key.dword("CompanionInstanceId", 123).unwrap();
+        let result = Backend::create();
+        let preserved = key.get("CompanionInstanceId");
+        drop(result);
+        if let Some(key) = Key::open(CONFIG).unwrap() {
+            key.text("CompanionInstanceId", &id).unwrap();
+        }
+        drop(Backend::create().unwrap());
+        assert_eq!(
+            preserved.unwrap(),
+            Some((REG_DWORD, 123u32.to_le_bytes().to_vec()))
+        );
     }
 }
