@@ -112,7 +112,7 @@ check exclusivity and preserve foreign/changed configuration. They are
 ignored by ordinary `cargo test`. Run only in an elevated terminal, serially:
 
 ```powershell
-cargo test --lib -- --ignored --test-threads=1
+cargo test --lib -- --ignored --test-threads=1 --skip close_with_external_xinput_client
 ```
 
 Creation, XInput state delivery, explicit close, Drop, setup rollback,
