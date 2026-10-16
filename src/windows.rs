@@ -1,6 +1,7 @@
 mod device;
 mod transport;
 pub(crate) use device::Backend;
+pub use transport::Writer;
 
 use crate::Result;
 use std::io;

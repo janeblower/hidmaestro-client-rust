@@ -3,6 +3,7 @@ use crate::{Result, report::EncodedFrame};
 use std::{
     io,
     mem::size_of,
+    os::windows::io::{BorrowedHandle, IntoRawHandle, OwnedHandle},
     ptr,
     sync::atomic::{Ordering, fence},
 };
@@ -51,6 +52,25 @@ struct Mapping {
     _handle: Handle,
 }
 impl Mapping {
+    fn from_handle(handle: Handle, size: u32) -> Result<Self> {
+        // The owned section handle stays live until the view is unmapped.
+        let view = unsafe {
+            MapViewOfFile(
+                handle.0,
+                FILE_MAP_READ | FILE_MAP_WRITE,
+                0,
+                0,
+                size as usize,
+            )
+        };
+        if view.Value.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            view,
+            _handle: handle,
+        })
+    }
     fn create(name: &str, size: u32, sa: &SECURITY_ATTRIBUTES) -> Result<Self> {
         // Pagefile-backed mapping; sa and name remain valid through the call.
         unsafe {
@@ -107,17 +127,91 @@ fn event(name: &str, sa: &SECURITY_ATTRIBUTES) -> Result<Handle> {
     }
 }
 
-pub(super) struct Transport {
+/// Writes directly to an existing HIDMaestro input mapping.
+pub struct Writer {
     input: Mapping,
     input_event: Handle,
     companion_event: Handle,
+    sequence: u32,
+}
+
+// Writer owns its view and events; submission requires exclusive access.
+unsafe impl Send for Writer {}
+
+impl Writer {
+    fn create(name: &str, sa: &SECURITY_ATTRIBUTES) -> Result<Self> {
+        Ok(Self {
+            input: Mapping::create(name, 362, sa)?,
+            input_event: event(&name.replace("Input", "InputEvent"), sa)?,
+            companion_event: event(&name.replace("Input", "CompanionInputEvent"), sa)?,
+            sequence: 0,
+        })
+    }
+
+    /// Imports the input section, input event and companion event, in that order.
+    ///
+    /// # Safety
+    /// The handles must refer to HIDMaestro's 362-byte input section and its
+    /// events. No other writer may submit until this writer has been dropped.
+    pub unsafe fn from_handles(handles: [OwnedHandle; 3]) -> Result<Self> {
+        let [input, input_event, companion_event] = handles.map(|h| Handle(h.into_raw_handle()));
+        let input = Mapping::from_handle(input, 362)?;
+        // The caller guarantees that the previous writer has stopped.
+        let sequence = unsafe { input.view.Value.cast::<u32>().read_volatile() };
+        if sequence & 1 != 0 {
+            return Err(io::Error::other("input writer stopped during publication"));
+        }
+        Ok(Self {
+            input,
+            input_event,
+            companion_event,
+            sequence,
+        })
+    }
+
+    /// Returns the section and two events for duplication into another process.
+    pub fn handles(&self) -> [BorrowedHandle<'_>; 3] {
+        // These handles are owned by self for the lifetime of the borrows.
+        unsafe {
+            [
+                self.input._handle.0,
+                self.input_event.0,
+                self.companion_event.0,
+            ]
+            .map(|h| BorrowedHandle::borrow_raw(h))
+        }
+    }
+
+    /// Publishes a validated state and wakes both driver input paths.
+    pub fn submit(&mut self, state: &crate::State) -> Result<()> {
+        self.publish(&crate::report::encode(state)?)
+    }
+
+    fn neutral(&mut self) -> Result<()> {
+        // A crashed writer may have stopped after publishing an odd sequence.
+        self.sequence = unsafe { self.input.view.Value.cast::<u32>().read_volatile() } & !1;
+        self.submit(&crate::State::default())
+    }
+
+    fn publish(&mut self, frame: &EncodedFrame) -> Result<()> {
+        // The mapping is live, page aligned, 362 bytes long and has one writer.
+        unsafe {
+            write_frame(self.input.view.Value.cast(), &mut self.sequence, frame);
+            check(SetEvent(self.input_event.0))?;
+            check(SetEvent(self.companion_event.0))
+        }
+    }
+}
+
+pub(super) struct Transport {
+    writer: Writer,
+    delegated: bool,
     _output: Mapping,
     _output_event: Handle,
     _ack: Mapping,
     _ack_event: Handle,
     _pipes: Vec<Handle>,
     _mutex: Handle,
-    sequence: u32,
 }
 
 impl Transport {
@@ -144,11 +238,9 @@ impl Transport {
             h
         };
         recover()?;
-        let input = Mapping::create("Global\\HIDMaestroInput0", 362, &sa)?;
+        let writer = Writer::create("Global\\HIDMaestroInput0", &sa)?;
         let output = Mapping::create("Global\\HIDMaestroOutput0", 8 + 64 * 264, &sa)?;
         let ack = Mapping::create("Global\\HIDMaestroInputAck0", 16 + 8 * 84, &sa)?;
-        let input_event = event("Global\\HIDMaestroInputEvent0", &sa)?;
-        let companion_event = event("Global\\HIDMaestroCompanionInputEvent0", &sa)?;
         let output_event = event("Global\\HIDMaestroOutputEvent0", &sa)?;
         let ack_event = event("Global\\HIDMaestroInputAckEvent0", &sa)?;
         let mut pipes = Vec::new();
@@ -174,26 +266,39 @@ impl Transport {
             });
         }
         Ok(Self {
-            input,
-            input_event,
-            companion_event,
+            writer,
+            delegated: false,
             _output: output,
             _output_event: output_event,
             _ack: ack,
             _ack_event: ack_event,
             _pipes: pipes,
             _mutex: mutex,
-            sequence: 0,
         })
     }
 
     pub fn publish(&mut self, frame: &EncodedFrame) -> Result<()> {
-        // The mapping is live, page aligned, 362 bytes long and has one writer.
-        unsafe {
-            write_frame(self.input.view.Value.cast(), &mut self.sequence, frame);
-            check(SetEvent(self.input_event.0))?;
-            check(SetEvent(self.companion_event.0))
+        if self.delegated {
+            return Err(io::Error::other("input writer has been delegated"));
         }
+        self.writer.publish(frame)
+    }
+
+    pub fn take_writer(&mut self) -> Result<Writer> {
+        if self.delegated {
+            return Err(io::Error::other("input writer has been delegated"));
+        }
+        let handles = self.writer.handles().map(|h| h.try_clone_to_owned());
+        let [a, b, c] = handles;
+        // The controller stops publishing until cleanup; the caller stops the
+        // delegated writer before cleanup, as required by take_writer.
+        let writer = unsafe { Writer::from_handles([a?, b?, c?]) }?;
+        self.delegated = true;
+        Ok(writer)
+    }
+
+    pub fn neutral(&mut self) -> Result<()> {
+        self.writer.neutral()
     }
 
     pub fn release(self) -> Handle {
@@ -226,6 +331,53 @@ unsafe fn write_frame(view: *mut u8, sequence: &mut u32, frame: &EncodedFrame) {
 mod tests {
     use super::*;
     use crate::{State, report};
+
+    #[test]
+    fn imported_writer_continues_sequence_and_signals_both_events() {
+        let sd = Security::new().unwrap();
+        let sa = sd.attributes();
+        let name = format!("Local\\HIDMaestroInputTest{}", std::process::id());
+        let mut writer = Writer::create(&name, &sa).unwrap();
+        writer.submit(&State::default()).unwrap();
+        let handles = writer.handles().map(|h| h.try_clone_to_owned().unwrap());
+        drop(writer);
+        // The original writer is gone and these are its only writable handles.
+        let mut imported = unsafe { Writer::from_handles(handles) }.unwrap();
+        imported
+            .submit(&State {
+                buttons: crate::Buttons::A,
+                ..State::default()
+            })
+            .unwrap();
+        let view = imported.input.view.Value.cast::<u8>();
+        unsafe {
+            assert_eq!(view.cast::<u32>().read_volatile(), 4);
+            assert_eq!(view.add(276).read_volatile(), 1);
+            assert_eq!(WaitForSingleObject(imported.input_event.0, 0), 0);
+            assert_eq!(WaitForSingleObject(imported.companion_event.0, 0), 0);
+        }
+    }
+
+    #[test]
+    fn neutral_recovers_a_writer_killed_mid_frame() {
+        let sd = Security::new().unwrap();
+        let mut writer = Writer::create(
+            &format!("Local\\HIDMaestroInputCrashTest{}", std::process::id()),
+            &sd.attributes(),
+        )
+        .unwrap();
+        let view = writer.input.view.Value.cast::<u8>();
+        // Simulate a dead publisher with a partly written A press.
+        unsafe {
+            view.cast::<u32>().write_volatile(3);
+            view.add(276).write_volatile(1);
+        }
+        writer.neutral().unwrap();
+        unsafe {
+            assert_eq!(view.cast::<u32>().read_volatile(), 4);
+            assert_eq!(view.add(276).read_volatile(), 0);
+        }
+    }
 
     #[test]
     fn wire_layout_and_sequence_wrap() {

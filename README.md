@@ -52,6 +52,26 @@ The actual companion ID is recorded separately under
 `HKLM\SOFTWARE\HIDMaestroRustClient\Controller0`; this journal is removed
 after successful cleanup. Do not edit either ownership record.
 
+For an application with a separate elevated lifecycle helper,
+`Controller::take_writer` delegates input publication and disables the
+controller's `submit`. The returned `Writer` exposes borrowed handles for
+the input section and its two events. Duplicate only those handles into the
+application, then import them with `Writer::from_handles`; driver mappings
+do not need broader access permissions. Both operations are unsafe: there
+must be one active writer, and every delegated writer and its handles must
+be stopped and dropped before closing or dropping the controller. Cleanup
+then publishes neutral using the latest shared sequence, including recovery
+from a writer terminated midway through a frame.
+
+If cleanup fails after releasing the transport, the controller retains its
+ownership lease and `Drop` retries removal and configuration cleanup.
+
+The pinned XUSB driver can retain mappings while another process keeps
+cached XInput handles without polling again. Removing the PnP nodes does
+not release those mappings; close that observer before retrying creation.
+The ignored `close_with_external_xinput_client` test reproduces this driver
+limitation and currently fails with an unmodified driver.
+
 ## Build and checks
 
 With a Windows Rust MSVC toolchain and linker installed:
@@ -92,7 +112,7 @@ check exclusivity and preserve foreign/changed configuration. They are
 ignored by ordinary `cargo test`. Run only in an elevated terminal, serially:
 
 ```powershell
-cargo test --lib -- --ignored --test-threads=1
+cargo test --lib -- --ignored --test-threads=1 --skip close_with_external_xinput_client
 ```
 
 Creation, XInput state delivery, explicit close, Drop, setup rollback,

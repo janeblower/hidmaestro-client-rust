@@ -2,6 +2,9 @@ mod report;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(windows)]
+pub use windows::Writer;
+
 pub type Result<T> = std::io::Result<T>;
 
 /// Owns one virtual Xbox 360 controller. Creation requires administrator rights.
@@ -15,6 +18,14 @@ impl Controller {
     }
     pub fn submit(&mut self, state: &State) -> Result<()> {
         self.0.submit(state)
+    }
+    /// Delegates input publication and disables this controller's `submit`.
+    ///
+    /// # Safety
+    /// The returned writer and any imported copies must be stopped and dropped
+    /// before closing or dropping the controller. Only one copy may publish.
+    pub unsafe fn take_writer(&mut self) -> Result<Writer> {
+        self.0.take_writer()
     }
     pub fn close(self) -> Result<()> {
         self.0.close()

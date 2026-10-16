@@ -672,6 +672,7 @@ pub(crate) struct Backend {
     root: bool,
     config: bool,
     transport: Option<Transport>,
+    lease: Option<Handle>,
     expected: BTreeMap<String, (u32, Vec<u8>)>,
     companion_id: Option<String>,
     journal: bool,
@@ -691,6 +692,7 @@ impl Backend {
             root: false,
             config: false,
             transport: Some(transport),
+            lease: None,
             expected: BTreeMap::new(),
             companion_id: None,
             journal: false,
@@ -859,20 +861,25 @@ impl Backend {
             .ok_or_else(|| io::Error::other("controller is closed"))?
             .publish(&frame)
     }
+    pub fn take_writer(&mut self) -> Result<super::Writer> {
+        self.transport
+            .as_mut()
+            .ok_or_else(|| io::Error::other("controller is closed"))?
+            .take_writer()
+    }
     fn cleanup(&mut self) -> Result<()> {
-        let mut error = if self.transport.is_some() {
-            self.submit(&State::default()).err()
+        let mut error = if let Some(transport) = self.transport.as_mut() {
+            transport.neutral().err()
         } else {
             None
         };
-        if let Some(device) = self.companion.take() {
-            let id = device.id.clone();
-            drop(device);
-            if let Err(e) = wait_for(|| !present(&id), "XUSB removal") {
+        drop(self.companion.take());
+        if let Some(id) = self.companion_id.as_deref() {
+            if let Err(e) = wait_for(|| !present(id), "XUSB removal") {
                 error.get_or_insert(e);
             }
-            if !present(&id)
-                && let Err(e) = remove_node(&id, SWD_HARDWARE)
+            if !present(id)
+                && let Err(e) = remove_node(id, SWD_HARDWARE)
             {
                 error.get_or_insert(e);
             }
@@ -886,12 +893,13 @@ impl Backend {
             }
         }
         let companion_gone = self.companion_id.as_deref().is_none_or(|id| !present(id));
-        let lease = if !self.root && companion_gone {
-            self.transport.take().map(Transport::release)
-        } else {
-            None
-        };
-        if lease.is_some()
+        if !self.root
+            && companion_gone
+            && let Some(transport) = self.transport.take()
+        {
+            self.lease = Some(transport.release());
+        }
+        if self.lease.is_some()
             && let Err(e) = wait_mappings()
         {
             error.get_or_insert(e);
@@ -933,7 +941,9 @@ impl Backend {
                 }
             }
         }
-        drop(lease);
+        if !self.config && !self.journal && !self.root && companion_gone {
+            self.lease.take();
+        }
         if let Some(e) = error { Err(e) } else { Ok(()) }
     }
     pub fn close(mut self) -> Result<()> {
@@ -942,7 +952,12 @@ impl Backend {
 }
 impl Drop for Backend {
     fn drop(&mut self) {
-        if self.transport.is_some() {
+        if self.transport.is_some()
+            || self.lease.is_some()
+            || self.root
+            || self.config
+            || self.journal
+        {
             let _ = self.cleanup();
         }
     }
@@ -951,6 +966,84 @@ impl Drop for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "explicit elevated test holds a mapping across cleanup and retries"]
+    fn failed_cleanup_keeps_ownership_until_retry() {
+        use windows_sys::Win32::System::Memory::*;
+        let mut backend = Backend::create().unwrap();
+        let held = Handle::new(unsafe {
+            OpenFileMappingW(FILE_MAP_READ, 0, wide("Global\\HIDMaestroInput0").as_ptr())
+        })
+        .unwrap();
+        assert_eq!(
+            backend.cleanup().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(backend.transport.is_none());
+        assert_eq!(
+            Backend::create().err().unwrap().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        drop(held);
+        drop(backend);
+        assert!(Key::open(CONFIG).unwrap().is_none());
+        assert!(Key::open(JOURNAL).unwrap().is_none());
+        drop(Backend::create().unwrap());
+    }
+
+    #[test]
+    #[ignore = "explicit elevated test removes devices with an external XInput client"]
+    fn close_with_external_xinput_client() {
+        use windows_sys::Win32::System::Threading::*;
+        let name = format!("Local\\HIDMaestroObserver{}", std::process::id());
+        if let Ok(parent) = std::env::var("HIDMAESTRO_OBSERVER_PARENT") {
+            let event = Handle::new(unsafe {
+                OpenEventW(
+                    EVENT_MODIFY_STATE,
+                    0,
+                    wide(&format!("Local\\HIDMaestroObserver{parent}")).as_ptr(),
+                )
+            })
+            .unwrap();
+            for slot in 0..4 {
+                let mut state =
+                    windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
+                unsafe {
+                    windows_sys::Win32::UI::Input::XboxController::XInputGetState(slot, &mut state);
+                }
+            }
+            unsafe {
+                SetEvent(event.0);
+            }
+            std::thread::sleep(Duration::from_secs(60));
+            return;
+        }
+        let ready =
+            Handle::new(unsafe { CreateEventW(ptr::null(), 1, 0, wide(&name).as_ptr()) }).unwrap();
+        let controller = Backend::create().unwrap();
+        let mut observer = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows::device::tests::close_with_external_xinput_client",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HIDMAESTRO_OBSERVER_PARENT", std::process::id().to_string())
+            .spawn()
+            .unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(ready.0, 5000) }, 0);
+        let closed = controller.close();
+        let recreated = if closed.is_ok() {
+            Backend::create().map(|c| c.close())
+        } else {
+            Ok(Ok(()))
+        };
+        let _ = observer.kill();
+        let _ = observer.wait();
+        closed.unwrap();
+        recreated.unwrap().unwrap();
+    }
 
     #[test]
     #[ignore = "explicit elevated test creates and removes HID/XUSB devices"]
@@ -1061,6 +1154,7 @@ mod tests {
         old.transport.take();
         old.root = false;
         old.config = false;
+        old.journal = false;
         drop(old);
         let recovered = Backend::create();
         if recovered.is_err() {
@@ -1080,6 +1174,7 @@ mod tests {
         old.transport.take();
         old.root = false;
         old.config = false;
+        old.journal = false;
         drop(old);
         let key = Key::open(CONFIG).unwrap().unwrap();
         key.dword("CompanionInstanceId", 123).unwrap();
