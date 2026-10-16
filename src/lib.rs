@@ -1,4 +1,6 @@
 mod report;
+#[cfg(windows)]
+mod windows;
 
 pub type Result<T> = std::io::Result<T>;
 
