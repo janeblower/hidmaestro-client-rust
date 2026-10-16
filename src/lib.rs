@@ -4,6 +4,23 @@ mod windows;
 
 pub type Result<T> = std::io::Result<T>;
 
+/// Owns one virtual Xbox 360 controller. Creation requires administrator rights.
+#[cfg(windows)]
+pub struct Controller(windows::Backend);
+
+#[cfg(windows)]
+impl Controller {
+    pub fn create() -> Result<Self> {
+        windows::Backend::create().map(Self)
+    }
+    pub fn submit(&mut self, state: &State) -> Result<()> {
+        self.0.submit(state)
+    }
+    pub fn close(self) -> Result<()> {
+        self.0.close()
+    }
+}
+
 /// Xbox 360 state; positive stick Y points up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct State {

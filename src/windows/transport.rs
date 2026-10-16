@@ -121,7 +121,12 @@ pub(super) struct Transport {
 }
 
 impl Transport {
+    #[cfg(test)]
     pub fn create() -> Result<Self> {
+        Self::create_with(|| Ok(()))
+    }
+
+    pub fn create_with(recover: impl FnOnce() -> Result<()>) -> Result<Self> {
         let sd = Security::new()?;
         let sa = sd.attributes();
         let mutex = unsafe {
@@ -138,6 +143,7 @@ impl Transport {
             }
             h
         };
+        recover()?;
         let input = Mapping::create("Global\\HIDMaestroInput0", 362, &sa)?;
         let output = Mapping::create("Global\\HIDMaestroOutput0", 8 + 64 * 264, &sa)?;
         let ack = Mapping::create("Global\\HIDMaestroInputAck0", 16 + 8 * 84, &sa)?;
@@ -153,7 +159,7 @@ impl Transport {
                 } else {
                     0
                 };
-            // Two watchdog readers (HID and XUSB); closing the server ends ownership.
+            // A restarted HID driver needs a second pipe instance to reconnect.
             pipes.push(unsafe {
                 Handle::new(CreateNamedPipeW(
                     wide(r"\\.\pipe\HIDMaestroOwner0").as_ptr(),
@@ -188,6 +194,10 @@ impl Transport {
             check(SetEvent(self.input_event.0))?;
             check(SetEvent(self.companion_event.0))
         }
+    }
+
+    pub fn release(self) -> Handle {
+        self._mutex
     }
 }
 
