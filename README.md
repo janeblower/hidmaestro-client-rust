@@ -33,7 +33,8 @@ D-pad directions are rejected. Guide is sent to the driver but the standard
 `XInputGetState` API does not report Guide.
 
 Only one client can own controller index 0. Creation refuses conflicting
-Global mappings or an existing foreign `HKLM\SOFTWARE\HIDMaestro\Controller0`.
+Global mappings without a valid ownership journal, or an existing foreign
+`HKLM\SOFTWARE\HIDMaestro\Controller0`.
 The library creates its own HID root node and XUSB software device. It does
 not sweep devices by VID/PID or edit shared OEM/GameInput mappings.
 
@@ -49,8 +50,9 @@ record can remain until the next successful `create`, which removes only
 the client's recorded root identity. Changed ownership/configuration causes
 an error and is preserved.
 The actual companion ID is recorded separately under
-`HKLM\SOFTWARE\HIDMaestroRustClient\Controller0`; this journal is removed
-after successful cleanup. Do not edit either ownership record.
+`HKLM\SOFTWARE\HIDMaestroRustClient\Controller0`. The journal remains after
+close if another process retains transport objects, so the next session can
+verify ownership before reopening them. Do not edit either ownership record.
 
 For an application with a separate elevated lifecycle helper,
 `Controller::take_writer` delegates input publication and disables the
@@ -67,10 +69,10 @@ If cleanup fails after releasing the transport, the controller retains its
 ownership lease and `Drop` retries removal and configuration cleanup.
 
 The pinned XUSB driver can retain mappings while another process keeps
-cached XInput handles without polling again. Removing the PnP nodes does
-not release those mappings; close that observer before retrying creation.
-The ignored `close_with_external_xinput_client` test reproduces this driver
-limitation and currently fails with an unmodified driver.
+cached XInput handles without polling again. After removing the old devices,
+the next session reopens the owned mappings and resets input, output,
+acknowledgements and events. Unowned objects, changed ownership records,
+remaining device nodes and existing owner pipes are still conflicts.
 
 ## Build and checks
 
@@ -112,7 +114,7 @@ check exclusivity and preserve foreign/changed configuration. They are
 ignored by ordinary `cargo test`. Run only in an elevated terminal, serially:
 
 ```powershell
-cargo test --lib -- --ignored --test-threads=1 --skip close_with_external_xinput_client
+cargo test --lib -- --ignored --test-threads=1
 ```
 
 Creation, XInput state delivery, explicit close, Drop, setup rollback,
