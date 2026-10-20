@@ -752,9 +752,6 @@ pub(crate) struct Backend {
 
 impl Backend {
     pub fn create() -> Result<Self> {
-        Self::create_inner(false)
-    }
-    fn create_inner(fail_after_hid: bool) -> Result<Self> {
         elevated()?;
         let inf = driver_inf(false)?;
         let companion_inf = driver_inf(true)?;
@@ -801,7 +798,8 @@ impl Backend {
             this.submit(&State::default())?;
             this.create_root(&inf)
                 .map_err(|e| io::Error::new(e.kind(), format!("HID setup: {e}")))?;
-            if fail_after_hid {
+            #[cfg(test)]
+            if tests::FAIL_AFTER_HID.get() {
                 return Err(io::Error::other("injected failure after HID registration"));
             }
             this.companion = Some(
@@ -1055,6 +1053,10 @@ impl Drop for Backend {
 mod tests {
     use super::*;
 
+    thread_local! {
+        pub(super) static FAIL_AFTER_HID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     #[test]
     fn interrupted_companion_record_is_recoverable() {
         let id = r"SWD\HIDMAESTRO\HM_RUST_CLIENT_0";
@@ -1275,10 +1277,13 @@ mod tests {
     #[test]
     #[ignore = "explicit elevated test creates and removes HID/XUSB devices"]
     fn lifecycle_rollback_and_recreate() {
-        assert!(Backend::create_inner(true).is_err());
+        FAIL_AFTER_HID.set(true);
+        let failed = Backend::create();
+        FAIL_AFTER_HID.set(false);
+        assert!(failed.is_err());
         assert!(!present(ROOT_ID));
         assert!(Key::open(CONFIG).unwrap().is_none());
-        let controller = Backend::create_inner(false).unwrap();
+        let controller = Backend::create().unwrap();
         assert!(present(ROOT_ID));
         for slot in 0..4 {
             let mut state = windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
@@ -1286,7 +1291,7 @@ mod tests {
                 windows_sys::Win32::UI::Input::XboxController::XInputGetState(slot, &mut state);
             }
         }
-        assert!(Backend::create_inner(false).is_err());
+        assert!(Backend::create().is_err());
         controller.close().unwrap();
         assert!(!present(ROOT_ID));
         let mut phantom = 0;
@@ -1300,7 +1305,7 @@ mod tests {
             },
             CR_SUCCESS
         );
-        drop(Backend::create_inner(false).unwrap());
+        drop(Backend::create().unwrap());
         assert!(!present(ROOT_ID));
     }
 
