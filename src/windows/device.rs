@@ -990,25 +990,27 @@ impl Backend {
                 }
             }
         }
-        if self.journal
-            && !self.config
-            && !self.root
-            && companion_gone
-            && let Some(key) = Key::open(JOURNAL)?
-        {
-            if !key.owned()? || key.companion_id()? != self.companion_id {
-                return Err(io::Error::other("journal ownership changed; preserving it"));
-            }
-            drop(key);
-            if retained {
-                self.journal = false;
-            } else {
-                match status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(JOURNAL).as_ptr()) })
-                {
-                    Ok(()) => self.journal = false,
-                    Err(e) => {
-                        error.get_or_insert(e);
-                    }
+        if self.journal && !self.config && !self.root && companion_gone {
+            let result = (|| {
+                let Some(key) = Key::open(JOURNAL)? else {
+                    return Ok(false);
+                };
+                let recorded = key.companion_id()?;
+                // Setup may fail before recording its companion, never with another one.
+                if !key.owned()? || recorded.is_some() && recorded != self.companion_id {
+                    return Err(io::Error::other("journal ownership changed; preserving it"));
+                }
+                drop(key);
+                if !retained {
+                    status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(JOURNAL).as_ptr()) })?;
+                }
+                Ok(true)
+            })();
+            match result {
+                Ok(true) => self.journal = false,
+                Ok(false) => {}
+                Err(e) => {
+                    error.get_or_insert(e);
                 }
             }
         }
