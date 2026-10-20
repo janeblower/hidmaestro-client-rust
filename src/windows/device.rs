@@ -33,7 +33,17 @@ const HARDWARE: &str =
 const NAME: &str = "Controller (XBOX 360 For Windows)";
 const HID_CLASS: GUID = GUID::from_u128(0x745a17a0_74d3_11d0_b6fe_00a0c90f57da);
 const CONTAINER: GUID = GUID::from_u128(0xc85bcbd9_a797_4e3f_945d_d5a0d121aa10);
-const DESCRIPTOR: &str = "05010905a101a10009300931150026ffff350046ffff950275108102c0a10009330934150026ffff350046ffff950275108102c0a1000932150026ffff350046ffff950175108102c0a10009400941150026ffff350046ffff950275108102c005091901290a950a7501810205010939150125083500463b10660e00750495018142750295018103750895028103c0";
+const DESCRIPTOR: [u8; 143] = [
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0xa1, 0x00, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xff,
+    0xff, 0x35, 0x00, 0x46, 0xff, 0xff, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xc0, 0xa1, 0x00, 0x09,
+    0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xff, 0xff, 0x35, 0x00, 0x46, 0xff, 0xff, 0x95, 0x02, 0x75,
+    0x10, 0x81, 0x02, 0xc0, 0xa1, 0x00, 0x09, 0x32, 0x15, 0x00, 0x26, 0xff, 0xff, 0x35, 0x00, 0x46,
+    0xff, 0xff, 0x95, 0x01, 0x75, 0x10, 0x81, 0x02, 0xc0, 0xa1, 0x00, 0x09, 0x40, 0x09, 0x41, 0x15,
+    0x00, 0x26, 0xff, 0xff, 0x35, 0x00, 0x46, 0xff, 0xff, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xc0,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x0a, 0x95, 0x0a, 0x75, 0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x39,
+    0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3b, 0x10, 0x66, 0x0e, 0x00, 0x75, 0x04, 0x95, 0x01,
+    0x81, 0x42, 0x75, 0x02, 0x95, 0x01, 0x81, 0x03, 0x75, 0x08, 0x95, 0x02, 0x81, 0x03, 0xc0,
+];
 
 fn status(code: u32) -> Result<()> {
     if code == ERROR_SUCCESS {
@@ -244,49 +254,54 @@ fn configuration() -> BTreeMap<String, (u32, Vec<u8>)> {
     ] {
         values.insert(name.into(), (REG_DWORD, value.to_le_bytes().to_vec()));
     }
-    let descriptor = DESCRIPTOR
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
-        .collect();
-    values.insert("ReportDescriptor".into(), (REG_BINARY, descriptor));
+    values.insert("ReportDescriptor".into(), (REG_BINARY, DESCRIPTOR.to_vec()));
     values
 }
 
-fn wait_mappings() -> Result<()> {
-    wait_for(
-        || {
-            // XInput caches file handles; observing removal lets this process release them.
-            for slot in 0..4 {
-                let mut state =
-                    windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
-                unsafe {
-                    windows_sys::Win32::UI::Input::XboxController::XInputGetState(slot, &mut state);
-                }
+fn transport_retained() -> Result<bool> {
+    // XInput caches file handles; observing removal releases this process's cache.
+    for slot in 0..4 {
+        let mut state = windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
+        unsafe {
+            windows_sys::Win32::UI::Input::XboxController::XInputGetState(slot, &mut state);
+        }
+    }
+    for name in [
+        "Input",
+        "Output",
+        "InputAck",
+        "InputEvent",
+        "CompanionInputEvent",
+        "OutputEvent",
+        "InputAckEvent",
+    ] {
+        let is_event = name.ends_with("Event");
+        let name = wide(&format!("Global\\HIDMaestro{name}0"));
+        let handle = unsafe {
+            if is_event {
+                windows_sys::Win32::System::Threading::OpenEventW(
+                    windows_sys::Win32::System::Threading::EVENT_MODIFY_STATE,
+                    0,
+                    name.as_ptr(),
+                )
+            } else {
+                windows_sys::Win32::System::Memory::OpenFileMappingW(
+                    windows_sys::Win32::System::Memory::FILE_MAP_READ,
+                    0,
+                    name.as_ptr(),
+                )
             }
-            for name in ["Input", "Output", "InputAck"] {
-                let handle = unsafe {
-                    windows_sys::Win32::System::Memory::OpenFileMappingW(
-                        windows_sys::Win32::System::Memory::FILE_MAP_READ,
-                        0,
-                        wide(&format!("Global\\HIDMaestro{name}0")).as_ptr(),
-                    )
-                };
-                if !handle.is_null() {
-                    drop(Handle::new(handle));
-                    return false;
-                }
-                if unsafe { windows_sys::Win32::Foundation::GetLastError() } != ERROR_FILE_NOT_FOUND
-                {
-                    return false;
-                }
-            }
-            true
-        },
-        "old driver mapping handles",
-    )
+        };
+        if !handle.is_null() {
+            drop(Handle::new(handle)?);
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_FILE_NOT_FOUND as i32) {
+            return Err(error);
+        }
+    }
+    Ok(false)
 }
 
 struct DeviceSet(HDEVINFO);
@@ -322,6 +337,14 @@ fn present(id: &str) -> bool {
     let mut node = 0;
     unsafe {
         CM_Locate_DevNodeW(&mut node, wide(id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS
+    }
+}
+
+fn absent(id: &str) -> bool {
+    let mut node = 0;
+    unsafe {
+        CM_Locate_DevNodeW(&mut node, wide(id).as_ptr(), CM_LOCATE_DEVNODE_PHANTOM)
+            == CR_NO_SUCH_DEVNODE
     }
 }
 
@@ -406,7 +429,7 @@ fn remove_node(id: &str, hardware_ids: &str) -> Result<()> {
     let set = DeviceSet::new()?;
     let data = match set.open(id) {
         Ok(d) => d,
-        Err(e) if !present(id) && e.raw_os_error() == Some(0xe000020b_u32 as i32) => {
+        Err(e) if absent(id) && e.raw_os_error() == Some(0xe000020b_u32 as i32) => {
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -432,8 +455,37 @@ fn remove_node(id: &str, hardware_ids: &str) -> Result<()> {
             "root identity is not owned by this client",
         ));
     }
+    let mut children = Vec::new();
+    let mut child = 0;
+    let mut rc = unsafe { CM_Get_Child(&mut child, data.DevInst, 0) };
+    while rc == CR_SUCCESS {
+        let mut id = [0u16; 4096];
+        let result = unsafe { CM_Get_Device_IDW(child, id.as_mut_ptr(), id.len() as u32, 0) };
+        if result != CR_SUCCESS {
+            return Err(io::Error::other(format!(
+                "read child identity: {result:#x}"
+            )));
+        }
+        let end = id.iter().position(|&c| c == 0).unwrap_or(id.len());
+        children.push(String::from_utf16(&id[..end]).map_err(io::Error::other)?);
+        let mut sibling = 0;
+        rc = unsafe { CM_Get_Sibling(&mut sibling, child, 0) };
+        child = sibling;
+    }
+    if rc != CR_NO_SUCH_DEVNODE {
+        return Err(io::Error::other(format!(
+            "enumerate owned children: {rc:#x}"
+        )));
+    }
+    for child in children {
+        if !absent(&child) {
+            let data = set.open(&child)?;
+            check(unsafe { SetupDiCallClassInstaller(DIF_REMOVE, set.0, &data) })?;
+        }
+        wait_for(|| absent(&child), "owned child removal")?;
+    }
     check(unsafe { SetupDiCallClassInstaller(DIF_REMOVE, set.0, &data) })?;
-    wait_for(|| !present(id), "device removal")
+    wait_for(|| absent(id), "device removal")
 }
 
 fn elevated() -> Result<()> {
@@ -460,7 +512,7 @@ fn elevated() -> Result<()> {
     Ok(())
 }
 
-fn recover() -> Result<()> {
+fn recover() -> Result<bool> {
     let journal = Key::open(JOURNAL)?;
     let recorded = if let Some(key) = &journal {
         if !key.owned()? {
@@ -486,11 +538,7 @@ fn recover() -> Result<()> {
                 "Controller0 belongs to another client",
             ));
         }
-        let mut expected = configuration();
-        if let Some(id) = &recorded {
-            expected.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
-        }
-        if key.snapshot()? != expected {
+        if !recoverable(&key.snapshot()?, recorded.as_deref()) {
             return Err(io::Error::other(
                 "configuration was modified; preserving it",
             ));
@@ -506,17 +554,37 @@ fn recover() -> Result<()> {
         if let Some(id) = &recorded {
             remove_node(id, SWD_HARDWARE)?;
         }
-        wait_mappings()?;
         status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(CONFIG).as_ptr()) })?;
     }
-    if journal.is_some() {
+    if let Some(key) = &journal {
         if recorded.as_deref().is_some_and(present) {
             return Err(io::Error::other("recorded companion is still present"));
         }
-        drop(journal);
-        status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(JOURNAL).as_ptr()) })?;
+        remove_root()?;
+        if let Some(id) = &recorded {
+            remove_node(id, SWD_HARDWARE)?;
+            status(unsafe { RegDeleteValueW(key.0, wide("CompanionInstanceId").as_ptr()) })?;
+        }
     }
-    Ok(())
+    if !absent(ROOT_ID) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "root device has no ownership record",
+        ));
+    }
+    Ok(journal.is_some())
+}
+
+/// Creation records the companion in the journal before the configuration, so a
+/// configuration without it is an interrupted creation rather than a foreign edit.
+fn recoverable(config: &BTreeMap<String, (u32, Vec<u8>)>, recorded: Option<&str>) -> bool {
+    let expected = configuration();
+    let Some(id) = recorded else {
+        return *config == expected;
+    };
+    let mut with_id = expected.clone();
+    with_id.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
+    *config == with_id || *config == expected
 }
 
 fn driver_inf(xusb: bool) -> Result<std::path::PathBuf> {
@@ -525,12 +593,16 @@ fn driver_inf(xusb: bool) -> Result<std::path::PathBuf> {
     )
     .join("INF");
     for entry in std::fs::read_dir(directory)? {
-        let path = entry?.path();
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
         let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
         if !name.starts_with("oem") || !name.ends_with(".inf") {
             continue;
         }
-        let bytes = std::fs::read(&path)?;
+        // Another vendor's locked or broken INF says nothing about these packages.
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         let content = if bytes.starts_with(&[0xff, 0xfe]) {
             String::from_utf16_lossy(
                 &bytes[2..]
@@ -680,9 +752,6 @@ pub(crate) struct Backend {
 
 impl Backend {
     pub fn create() -> Result<Self> {
-        Self::create_inner(false)
-    }
-    fn create_inner(fail_after_hid: bool) -> Result<Self> {
         elevated()?;
         let inf = driver_inf(false)?;
         let companion_inf = driver_inf(true)?;
@@ -719,14 +788,18 @@ impl Backend {
                 this.expected.insert(name, (kind, bytes));
             }
             drop(key);
-            let journal = Key::create(JOURNAL)?;
+            let journal = match Key::open(JOURNAL)? {
+                Some(key) => key,
+                None => Key::create(JOURNAL)?,
+            };
             this.journal = true;
             journal.text("RustClientOwner", OWNER)?;
             drop(journal);
             this.submit(&State::default())?;
             this.create_root(&inf)
                 .map_err(|e| io::Error::new(e.kind(), format!("HID setup: {e}")))?;
-            if fail_after_hid {
+            #[cfg(test)]
+            if tests::FAIL_AFTER_HID.get() {
                 return Err(io::Error::other("injected failure after HID registration"));
             }
             this.companion = Some(
@@ -892,18 +965,24 @@ impl Backend {
                 }
             }
         }
-        let companion_gone = self.companion_id.as_deref().is_none_or(|id| !present(id));
+        let companion_gone = self.companion_id.as_deref().is_none_or(absent);
         if !self.root
             && companion_gone
             && let Some(transport) = self.transport.take()
         {
             self.lease = Some(transport.release());
         }
-        if self.lease.is_some()
-            && let Err(e) = wait_mappings()
-        {
-            error.get_or_insert(e);
-        }
+        let retained = if self.lease.is_some() {
+            match transport_retained() {
+                Ok(retained) => retained,
+                Err(e) => {
+                    error.get_or_insert(e);
+                    true
+                }
+            }
+        } else {
+            false
+        };
         if self.config && !self.root && companion_gone && error.is_none() {
             let result = (|| {
                 if let Some(key) = Key::open(CONFIG)? {
@@ -924,18 +1003,25 @@ impl Backend {
                 }
             }
         }
-        if self.journal
-            && !self.config
-            && !self.root
-            && companion_gone
-            && let Some(key) = Key::open(JOURNAL)?
-        {
-            if !key.owned()? || key.companion_id()? != self.companion_id {
-                return Err(io::Error::other("journal ownership changed; preserving it"));
-            }
-            drop(key);
-            match status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(JOURNAL).as_ptr()) }) {
-                Ok(()) => self.journal = false,
+        if self.journal && !self.config && !self.root && companion_gone {
+            let result = (|| {
+                let Some(key) = Key::open(JOURNAL)? else {
+                    return Ok(false);
+                };
+                let recorded = key.companion_id()?;
+                // Setup may fail before recording its companion, never with another one.
+                if !key.owned()? || recorded.is_some() && recorded != self.companion_id {
+                    return Err(io::Error::other("journal ownership changed; preserving it"));
+                }
+                drop(key);
+                if !retained {
+                    status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(JOURNAL).as_ptr()) })?;
+                }
+                Ok(true)
+            })();
+            match result {
+                Ok(true) => self.journal = false,
+                Ok(false) => {}
                 Err(e) => {
                     error.get_or_insert(e);
                 }
@@ -967,35 +1053,57 @@ impl Drop for Backend {
 mod tests {
     use super::*;
 
+    thread_local! {
+        pub(super) static FAIL_AFTER_HID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     #[test]
-    #[ignore = "explicit elevated test holds a mapping across cleanup and retries"]
-    fn failed_cleanup_keeps_ownership_until_retry() {
+    fn interrupted_companion_record_is_recoverable() {
+        let id = r"SWD\HIDMAESTRO\HM_RUST_CLIENT_0";
+        let bare = configuration();
+        let mut recorded = bare.clone();
+        recorded.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
+        assert!(recoverable(&bare, None));
+        assert!(recoverable(&recorded, Some(id)));
+        assert!(recoverable(&bare, Some(id)));
+        assert!(!recoverable(&recorded, None));
+        assert!(!recoverable(&recorded, Some("other")));
+        let mut foreign = bare;
+        foreign.insert("ProductId".into(), (REG_DWORD, 1u32.to_le_bytes().to_vec()));
+        assert!(!recoverable(&foreign, Some(id)));
+    }
+
+    #[test]
+    #[ignore = "explicit elevated test retains a mapping across controller sessions"]
+    fn retained_transport_is_reused_after_close() {
         use windows_sys::Win32::System::Memory::*;
         let mut backend = Backend::create().unwrap();
         let held = Handle::new(unsafe {
             OpenFileMappingW(FILE_MAP_READ, 0, wide("Global\\HIDMaestroInput0").as_ptr())
         })
         .unwrap();
-        assert_eq!(
-            backend.cleanup().unwrap_err().kind(),
-            io::ErrorKind::TimedOut
-        );
+        backend.cleanup().unwrap();
         assert!(backend.transport.is_none());
-        assert_eq!(
-            Backend::create().err().unwrap().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        drop(held);
-        drop(backend);
         assert!(Key::open(CONFIG).unwrap().is_none());
-        assert!(Key::open(JOURNAL).unwrap().is_none());
-        drop(Backend::create().unwrap());
+        assert!(Key::open(JOURNAL).unwrap().is_some());
+        let next = Backend::create().unwrap();
+        drop(backend);
+        assert!(Backend::create().is_err());
+        next.close().unwrap();
+        drop(held);
+        Backend::create().unwrap().close().unwrap();
     }
 
     #[test]
     #[ignore = "explicit elevated test removes devices with an external XInput client"]
     fn close_with_external_xinput_client() {
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::Threading::*;
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE},
+            Storage::FileSystem::*,
+            System::IO::DeviceIoControl,
+        };
         let name = format!("Local\\HIDMaestroObserver{}", std::process::id());
         if let Ok(parent) = std::env::var("HIDMAESTRO_OBSERVER_PARENT") {
             let event = Handle::new(unsafe {
@@ -1006,6 +1114,58 @@ mod tests {
                 )
             })
             .unwrap();
+            let resume = Handle::new(unsafe {
+                OpenEventW(
+                    SYNCHRONIZATION_SYNCHRONIZE,
+                    0,
+                    wide(&format!("Local\\HIDMaestroObserver{parent}Resume")).as_ptr(),
+                )
+            })
+            .unwrap();
+            let id = std::env::var("HIDMAESTRO_OBSERVER_DEVICE").unwrap();
+            let guid = GUID::from_u128(0xec87f1e3_c13b_4100_b5f7_8b84d54260cb);
+            let mut path = [0u16; 4096];
+            assert_eq!(
+                unsafe {
+                    CM_Get_Device_Interface_ListW(
+                        &guid,
+                        wide(&id).as_ptr(),
+                        path.as_mut_ptr(),
+                        path.len() as u32,
+                        CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+                    )
+                },
+                CR_SUCCESS
+            );
+            assert_ne!(path[0], 0);
+            let old = Handle::new(unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    ptr::null_mut(),
+                )
+            })
+            .unwrap();
+            let mut bytes = [0u8; 29];
+            let mut returned = 0;
+            check(unsafe {
+                DeviceIoControl(
+                    old.0,
+                    0x8000e00c,
+                    ptr::null(),
+                    0,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len() as u32,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            })
+            .unwrap();
+            assert_eq!(u16::from_le_bytes([bytes[11], bytes[12]]), 0x1000);
             for slot in 0..4 {
                 let mut state =
                     windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
@@ -1016,42 +1176,114 @@ mod tests {
             unsafe {
                 SetEvent(event.0);
             }
-            std::thread::sleep(Duration::from_secs(60));
+            assert_eq!(unsafe { WaitForSingleObject(resume.0, 30_000) }, 0);
+            for code in [0x8000e00c, 0x8000a010] {
+                assert_eq!(
+                    unsafe {
+                        DeviceIoControl(
+                            old.0,
+                            code,
+                            bytes.as_ptr().cast(),
+                            bytes.len() as u32,
+                            bytes.as_mut_ptr().cast(),
+                            bytes.len() as u32,
+                            &mut returned,
+                            ptr::null_mut(),
+                        )
+                    },
+                    0,
+                    "removed XUSB handle still accepts IOCTL {code:#x}"
+                );
+            }
+            drop(old);
+            wait_for(
+                || {
+                    (0..4).any(|slot| {
+                        let mut state =
+                            windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
+                        (unsafe {
+                            windows_sys::Win32::UI::Input::XboxController::XInputGetState(
+                                slot, &mut state,
+                            )
+                        }) == 0
+                            && state.Gamepad.wButtons == 0x2000
+                    })
+                },
+                "recreated controller B press",
+            )
+            .unwrap();
             return;
         }
-        let ready =
-            Handle::new(unsafe { CreateEventW(ptr::null(), 1, 0, wide(&name).as_ptr()) }).unwrap();
-        let controller = Backend::create().unwrap();
-        let mut observer = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "windows::device::tests::close_with_external_xinput_client",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("HIDMAESTRO_OBSERVER_PARENT", std::process::id().to_string())
-            .spawn()
+        for _ in 0..3 {
+            let ready =
+                Handle::new(unsafe { CreateEventW(ptr::null(), 1, 0, wide(&name).as_ptr()) })
+                    .unwrap();
+            let resume = Handle::new(unsafe {
+                CreateEventW(ptr::null(), 1, 0, wide(&format!("{name}Resume")).as_ptr())
+            })
             .unwrap();
-        assert_eq!(unsafe { WaitForSingleObject(ready.0, 5000) }, 0);
-        let closed = controller.close();
-        let recreated = if closed.is_ok() {
-            Backend::create().map(|c| c.close())
-        } else {
-            Ok(Ok(()))
-        };
-        let _ = observer.kill();
-        let _ = observer.wait();
-        closed.unwrap();
-        recreated.unwrap().unwrap();
+            let mut controller = Backend::create().unwrap();
+            controller
+                .submit(&State {
+                    buttons: crate::Buttons::A,
+                    ..State::default()
+                })
+                .unwrap();
+            let mut observer = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows::device::tests::close_with_external_xinput_client",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HIDMAESTRO_OBSERVER_PARENT", std::process::id().to_string())
+                .env(
+                    "HIDMAESTRO_OBSERVER_DEVICE",
+                    controller.companion_id.as_ref().unwrap(),
+                )
+                .spawn()
+                .unwrap();
+            let result = (|| -> Result<()> {
+                if unsafe { WaitForSingleObject(ready.0, 5000) } != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "external observer startup",
+                    ));
+                }
+                controller.close()?;
+                let mut recreated = Backend::create()?;
+                recreated.submit(&State {
+                    buttons: crate::Buttons::B,
+                    ..State::default()
+                })?;
+                check(unsafe { SetEvent(resume.0) })?;
+                if unsafe { WaitForSingleObject(observer.as_raw_handle(), 20_000) } != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "external observer checks",
+                    ));
+                }
+                if !observer.wait()?.success() {
+                    return Err(io::Error::other("external observer failed"));
+                }
+                recreated.close()
+            })();
+            let _ = observer.kill();
+            let _ = observer.wait();
+            result.unwrap();
+        }
     }
 
     #[test]
     #[ignore = "explicit elevated test creates and removes HID/XUSB devices"]
     fn lifecycle_rollback_and_recreate() {
-        assert!(Backend::create_inner(true).is_err());
+        FAIL_AFTER_HID.set(true);
+        let failed = Backend::create();
+        FAIL_AFTER_HID.set(false);
+        assert!(failed.is_err());
         assert!(!present(ROOT_ID));
         assert!(Key::open(CONFIG).unwrap().is_none());
-        let controller = Backend::create_inner(false).unwrap();
+        let controller = Backend::create().unwrap();
         assert!(present(ROOT_ID));
         for slot in 0..4 {
             let mut state = windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
@@ -1059,7 +1291,7 @@ mod tests {
                 windows_sys::Win32::UI::Input::XboxController::XInputGetState(slot, &mut state);
             }
         }
-        assert!(Backend::create_inner(false).is_err());
+        assert!(Backend::create().is_err());
         controller.close().unwrap();
         assert!(!present(ROOT_ID));
         let mut phantom = 0;
@@ -1073,7 +1305,7 @@ mod tests {
             },
             CR_SUCCESS
         );
-        drop(Backend::create_inner(false).unwrap());
+        drop(Backend::create().unwrap());
         assert!(!present(ROOT_ID));
     }
 

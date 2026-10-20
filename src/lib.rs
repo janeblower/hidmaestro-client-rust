@@ -1,3 +1,7 @@
+// HIDMaestro ships x64 drivers, and a 32-bit process would see redirected registry keys.
+#[cfg(all(windows, not(target_arch = "x86_64")))]
+compile_error!("hidmaestro-client supports only x86_64 Windows");
+
 mod report;
 #[cfg(windows)]
 mod windows;
@@ -8,14 +12,23 @@ pub use windows::Writer;
 pub type Result<T> = std::io::Result<T>;
 
 /// Owns one virtual Xbox 360 controller. Creation requires administrator rights.
+///
+/// The controller is not `Send`: create, use and close it on one thread. Its
+/// [`Writer`] is `Send` and may publish from another thread.
 #[cfg(windows)]
 pub struct Controller(windows::Backend);
 
 #[cfg(windows)]
 impl Controller {
+    /// Installs the HID and XUSB devices and waits for Windows to start them.
+    ///
+    /// Blocks while PnP installs the devices, which can take a minute or more.
+    /// Leftovers of a crashed owner are removed first; anything this client
+    /// does not recognise as its own is left alone and reported as an error.
     pub fn create() -> Result<Self> {
         windows::Backend::create().map(Self)
     }
+    /// Publishes one input report.
     pub fn submit(&mut self, state: &State) -> Result<()> {
         self.0.submit(state)
     }
@@ -27,6 +40,10 @@ impl Controller {
     pub unsafe fn take_writer(&mut self) -> Result<Writer> {
         self.0.take_writer()
     }
+    /// Neutralises input and removes the devices, reporting cleanup errors.
+    ///
+    /// Blocks until PnP removes the devices. Dropping the controller does the
+    /// same but discards the errors.
     pub fn close(self) -> Result<()> {
         self.0.close()
     }

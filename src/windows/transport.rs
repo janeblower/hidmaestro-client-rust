@@ -71,7 +71,7 @@ impl Mapping {
             _handle: handle,
         })
     }
-    fn create(name: &str, size: u32, sa: &SECURITY_ATTRIBUTES) -> Result<Self> {
+    fn create(name: &str, size: u32, sa: &SECURITY_ATTRIBUTES, reuse: bool) -> Result<Self> {
         // Pagefile-backed mapping; sa and name remain valid through the call.
         unsafe {
             let handle = Handle::new(CreateFileMappingW(
@@ -82,7 +82,8 @@ impl Mapping {
                 size,
                 wide(name).as_ptr(),
             ))?;
-            if GetLastError() == ERROR_ALREADY_EXISTS {
+            let existed = GetLastError() == ERROR_ALREADY_EXISTS;
+            if existed && !reuse {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     name.to_owned(),
@@ -97,6 +98,10 @@ impl Mapping {
             );
             if view.Value.is_null() {
                 return Err(io::Error::last_os_error());
+            }
+            if existed {
+                // Recovery has verified ownership and removed the previous devices.
+                view.Value.cast::<u8>().write_bytes(0, size as usize);
             }
             Ok(Self {
                 view,
@@ -114,14 +119,17 @@ impl Drop for Mapping {
     }
 }
 
-fn event(name: &str, sa: &SECURITY_ATTRIBUTES) -> Result<Handle> {
+fn event(name: &str, sa: &SECURITY_ATTRIBUTES, reuse: bool) -> Result<Handle> {
     unsafe {
         let h = Handle::new(CreateEventW(sa, 0, 0, wide(name).as_ptr()))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                name.to_owned(),
-            ));
+            if !reuse {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    name.to_owned(),
+                ));
+            }
+            check(ResetEvent(h.0))?;
         }
         Ok(h)
     }
@@ -139,11 +147,11 @@ pub struct Writer {
 unsafe impl Send for Writer {}
 
 impl Writer {
-    fn create(name: &str, sa: &SECURITY_ATTRIBUTES) -> Result<Self> {
+    fn create(name: &str, sa: &SECURITY_ATTRIBUTES, reuse: bool) -> Result<Self> {
         Ok(Self {
-            input: Mapping::create(name, 362, sa)?,
-            input_event: event(&name.replace("Input", "InputEvent"), sa)?,
-            companion_event: event(&name.replace("Input", "CompanionInputEvent"), sa)?,
+            input: Mapping::create(name, 362, sa, reuse)?,
+            input_event: event(&name.replace("Input", "InputEvent"), sa, reuse)?,
+            companion_event: event(&name.replace("Input", "CompanionInputEvent"), sa, reuse)?,
             sequence: 0,
         })
     }
@@ -217,10 +225,10 @@ pub(super) struct Transport {
 impl Transport {
     #[cfg(test)]
     pub fn create() -> Result<Self> {
-        Self::create_with(|| Ok(()))
+        Self::create_with(|| Ok(true))
     }
 
-    pub fn create_with(recover: impl FnOnce() -> Result<()>) -> Result<Self> {
+    pub fn create_with(recover: impl FnOnce() -> Result<bool>) -> Result<Self> {
         let sd = Security::new()?;
         let sa = sd.attributes();
         let mutex = unsafe {
@@ -237,12 +245,7 @@ impl Transport {
             }
             h
         };
-        recover()?;
-        let writer = Writer::create("Global\\HIDMaestroInput0", &sa)?;
-        let output = Mapping::create("Global\\HIDMaestroOutput0", 8 + 64 * 264, &sa)?;
-        let ack = Mapping::create("Global\\HIDMaestroInputAck0", 16 + 8 * 84, &sa)?;
-        let output_event = event("Global\\HIDMaestroOutputEvent0", &sa)?;
-        let ack_event = event("Global\\HIDMaestroInputAckEvent0", &sa)?;
+        let reuse = recover()?;
         let mut pipes = Vec::new();
         for i in 0..2 {
             let flags = PIPE_ACCESS_OUTBOUND
@@ -265,6 +268,11 @@ impl Transport {
                 ))?
             });
         }
+        let writer = Writer::create("Global\\HIDMaestroInput0", &sa, reuse)?;
+        let output = Mapping::create("Global\\HIDMaestroOutput0", 8 + 64 * 264, &sa, reuse)?;
+        let ack = Mapping::create("Global\\HIDMaestroInputAck0", 16 + 8 * 84, &sa, reuse)?;
+        let output_event = event("Global\\HIDMaestroOutputEvent0", &sa, reuse)?;
+        let ack_event = event("Global\\HIDMaestroInputAckEvent0", &sa, reuse)?;
         Ok(Self {
             writer,
             delegated: false,
@@ -333,11 +341,42 @@ mod tests {
     use crate::{State, report};
 
     #[test]
+    fn retained_mapping_is_reset_on_reopen() {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            ..Default::default()
+        };
+        let name = format!("Local\\HIDMaestroRetainedTest{}", std::process::id());
+        let old = Mapping::create(&name, 8192, &sa, false).unwrap();
+        unsafe { old.view.Value.cast::<u8>().write_bytes(0xff, 8192) };
+        assert!(Mapping::create(&name, 8192, &sa, false).is_err());
+        assert!(Mapping::create(&name, 16384, &sa, true).is_err());
+        assert_eq!(unsafe { old.view.Value.cast::<u8>().read_volatile() }, 0xff);
+        let reopened = Mapping::create(&name, 8192, &sa, true).unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(reopened.view.Value.cast::<u8>(), 8192) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn retained_event_is_reset_on_reopen() {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            ..Default::default()
+        };
+        let name = format!("Local\\HIDMaestroRetainedEventTest{}", std::process::id());
+        let old = event(&name, &sa, false).unwrap();
+        check(unsafe { SetEvent(old.0) }).unwrap();
+        assert!(event(&name, &sa, false).is_err());
+        let reopened = event(&name, &sa, true).unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(reopened.0, 0) }, 258);
+    }
+
+    #[test]
     fn imported_writer_continues_sequence_and_signals_both_events() {
         let sd = Security::new().unwrap();
         let sa = sd.attributes();
         let name = format!("Local\\HIDMaestroInputTest{}", std::process::id());
-        let mut writer = Writer::create(&name, &sa).unwrap();
+        let mut writer = Writer::create(&name, &sa, false).unwrap();
         writer.submit(&State::default()).unwrap();
         let handles = writer.handles().map(|h| h.try_clone_to_owned().unwrap());
         drop(writer);
@@ -364,6 +403,7 @@ mod tests {
         let mut writer = Writer::create(
             &format!("Local\\HIDMaestroInputCrashTest{}", std::process::id()),
             &sd.attributes(),
+            false,
         )
         .unwrap();
         let view = writer.input.view.Value.cast::<u8>();
@@ -405,10 +445,32 @@ mod tests {
     fn exclusive_transport_and_reopen() {
         let mut first = Transport::create().unwrap();
         first
-            .publish(&report::encode(&State::default()).unwrap())
+            .publish(
+                &report::encode(&State {
+                    buttons: crate::Buttons::A,
+                    ..State::default()
+                })
+                .unwrap(),
+            )
             .unwrap();
         assert!(Transport::create().is_err());
+        let input = first.writer.handles()[0].try_clone_to_owned().unwrap();
+        let retained = Mapping::from_handle(Handle(input.into_raw_handle()), 362).unwrap();
+        let pipe = unsafe { BorrowedHandle::borrow_raw(first._pipes[0].0) }
+            .try_clone_to_owned()
+            .unwrap();
         drop(first);
+        assert!(Transport::create().is_err());
+        assert_eq!(
+            unsafe { retained.view.Value.cast::<u8>().add(276).read_volatile() },
+            1
+        );
+        drop(pipe);
+        assert!(Transport::create_with(|| Ok(false)).is_err());
+        assert_eq!(
+            unsafe { retained.view.Value.cast::<u8>().add(276).read_volatile() },
+            1
+        );
         drop(Transport::create().unwrap());
     }
 }
