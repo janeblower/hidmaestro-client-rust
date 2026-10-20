@@ -535,11 +535,7 @@ fn recover() -> Result<bool> {
                 "Controller0 belongs to another client",
             ));
         }
-        let mut expected = configuration();
-        if let Some(id) = &recorded {
-            expected.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
-        }
-        if key.snapshot()? != expected {
+        if !recoverable(&key.snapshot()?, recorded.as_deref()) {
             return Err(io::Error::other(
                 "configuration was modified; preserving it",
             ));
@@ -574,6 +570,18 @@ fn recover() -> Result<bool> {
         ));
     }
     Ok(journal.is_some())
+}
+
+/// Creation records the companion in the journal before the configuration, so a
+/// configuration without it is an interrupted creation rather than a foreign edit.
+fn recoverable(config: &BTreeMap<String, (u32, Vec<u8>)>, recorded: Option<&str>) -> bool {
+    let expected = configuration();
+    let Some(id) = recorded else {
+        return *config == expected;
+    };
+    let mut with_id = expected.clone();
+    with_id.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
+    *config == with_id || *config == expected
 }
 
 fn driver_inf(xusb: bool) -> Result<std::path::PathBuf> {
@@ -1039,6 +1047,22 @@ impl Drop for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_companion_record_is_recoverable() {
+        let id = r"SWD\HIDMAESTRO\HM_RUST_CLIENT_0";
+        let bare = configuration();
+        let mut recorded = bare.clone();
+        recorded.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
+        assert!(recoverable(&bare, None));
+        assert!(recoverable(&recorded, Some(id)));
+        assert!(recoverable(&bare, Some(id)));
+        assert!(!recoverable(&recorded, None));
+        assert!(!recoverable(&recorded, Some("other")));
+        let mut foreign = bare;
+        foreign.insert("ProductId".into(), (REG_DWORD, 1u32.to_le_bytes().to_vec()));
+        assert!(!recoverable(&foreign, Some(id)));
+    }
 
     #[test]
     #[ignore = "explicit elevated test retains a mapping across controller sessions"]
