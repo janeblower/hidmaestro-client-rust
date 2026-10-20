@@ -598,8 +598,12 @@ fn remove_node(id: &str, hardware_ids: &str, transport: Option<&Transport>) -> R
                 CM_REMOVE_UI_NOT_OK | CM_REMOVE_NO_RESTART,
             )
         } == CR_SUCCESS;
+        #[cfg(test)]
+        tests::QUERY_REMOVED.set(Some(removed));
         if !removed {
-            transport.eject();
+            let _ejected = transport.eject();
+            #[cfg(test)]
+            tests::EJECTED.set(_ejected);
         }
     }
     for child in children {
@@ -1245,6 +1249,103 @@ mod tests {
 
     thread_local! {
         pub(super) static FAIL_AFTER_HID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static EJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static QUERY_REMOVED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn hid_child_interface() -> Vec<u16> {
+        let guid = GUID::from_u128(0x4d1e55b2_f16f_11cf_88cb_001111000030);
+        let (mut root, mut child) = (0, 0);
+        let mut id = [0u16; 4096];
+        let mut path = [0u16; 4096];
+        unsafe {
+            assert_eq!(
+                CM_Locate_DevNodeW(&mut root, wide(ROOT_ID).as_ptr(), 0),
+                CR_SUCCESS
+            );
+            assert_eq!(CM_Get_Child(&mut child, root, 0), CR_SUCCESS);
+            assert_eq!(
+                CM_Get_Device_IDW(child, id.as_mut_ptr(), id.len() as u32, 0),
+                CR_SUCCESS
+            );
+            assert_eq!(
+                CM_Get_Device_Interface_ListW(
+                    &guid,
+                    id.as_ptr(),
+                    path.as_mut_ptr(),
+                    path.len() as u32,
+                    CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+                ),
+                CR_SUCCESS
+            );
+        }
+        let end = path.iter().position(|&c| c == 0).unwrap();
+        assert_ne!(end, 0, "HID child has no interface");
+        path[..=end].to_vec()
+    }
+
+    #[test]
+    #[ignore = "explicit elevated test removes a HID device another handle holds open"]
+    fn close_ejects_a_held_hid_child() {
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE},
+            Storage::FileSystem::*,
+        };
+        let controller = Backend::create().unwrap();
+        let path = hid_child_interface();
+        // A handle with no read pending and no PnP notification refuses the
+        // removal query, as Steam's does with PlayStation pads.
+        let held = Handle::new(unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        })
+        .unwrap();
+        let raw = held.0 as usize;
+        std::mem::forget(held);
+        // The holder lets go only once the parent has left the device tree,
+        // which a removal query cannot achieve while the handle is open.
+        let holder = std::thread::spawn(move || {
+            let begin = Instant::now();
+            while present(ROOT_ID) && begin.elapsed() < Duration::from_secs(40) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // The holder owns the handle from here on.
+            drop(Handle(raw as _));
+            begin.elapsed()
+        });
+        EJECTED.set(false);
+        QUERY_REMOVED.set(None);
+        let begin = Instant::now();
+        let closed = controller.close();
+        let took = begin.elapsed();
+        let held_for = holder.join().unwrap();
+        println!(
+            "query removed: {:?}; ejected: {}; close: {closed:?} in {took:?}; handle held {held_for:?}",
+            QUERY_REMOVED.get(),
+            EJECTED.get()
+        );
+        assert_eq!(
+            QUERY_REMOVED.get(),
+            Some(false),
+            "the holder did not refuse"
+        );
+        assert!(
+            EJECTED.get(),
+            "the driver did not answer the removal request"
+        );
+        closed.unwrap();
+        assert!(!present(ROOT_ID));
+        // The removal left the identity whole: a new HID child starts on it.
+        let again = Backend::create().unwrap();
+        hid_child_interface();
+        again.close().unwrap();
     }
 
     #[test]
