@@ -4,12 +4,14 @@ Native Rust client for one HIDMaestro `xbox-360-wired` controller on Windows
 x64. It calls Win32 directly; no .NET runtime, SDK process or custom driver
 is required by the client.
 
-Requires administrator privileges and both HIDMaestro v1.12.0 driver
-packages, version **1.12.0.2302**: `hidmaestro.inf` and `hidmaestro_xusb.inf`.
+Requires administrator privileges and both HIDMaestro v2.0.0 driver
+packages, version **2.0.0.2201**: `hidmaestro.inf` and `hidmaestro_xusb.inf`.
 Install those separately using the upstream release instructions. This crate
 does not install drivers, create signing certificates or change Windows
 security settings. Driver source/protocol is pinned to upstream commit
-`b4d29d9f4b1b91ced6b4755f095184b66339b8be`.
+`0c5676fb482776b0ef7589dc4937f7dc9fc57c1c`. The client speaks driver
+protocol 4 (the v2.0.0 version contract) and uses protocol 5 removal when
+the driver offers it; creation fails if a started driver does not serve 4.
 
 ```rust,no_run
 use hidmaestro_client::{Buttons, Controller, State};
@@ -34,12 +36,16 @@ D-pad directions are rejected. Guide is sent to the driver but the standard
 
 Only one client can own controller index 0. Creation refuses conflicting
 Global mappings without a valid ownership journal, or an existing foreign
-`HKLM\SOFTWARE\HIDMaestro\Controller0`.
+`HKLM\SOFTWARE\HIDMaestro\Controller0`. The client also writes the identity
+entry `HKLM\SOFTWARE\HIDMaestro\Identity\HM_RUST_CLIENT_0`, through which
+both drivers find the controller's index before they start.
 The library creates its own HID root node and XUSB software device. It does
 not sweep devices by VID/PID or edit shared OEM/GameInput mappings.
 
 `close` sends neutral state, removes the client's devices and configuration,
-and reports cleanup failures. `Drop` attempts the same cleanup but cannot
+and reports cleanup failures. The HID device is removed with a removal query
+first; when a program holding it refuses, the driver fails the device as an
+unplug does, instead of leaving its HID child without a driver. `Drop` attempts the same cleanup but cannot
 return an error; prefer explicit `close`. If another program changes the
 configuration, cleanup preserves it and returns an error. Do not edit the
 client's configuration while it is running.
@@ -53,6 +59,8 @@ The actual companion ID is recorded separately under
 `HKLM\SOFTWARE\HIDMaestroRustClient\Controller0`. The journal remains after
 close if another process retains transport objects, so the next session can
 verify ownership before reopening them. Do not edit either ownership record.
+A configuration left by the previous version of this client, built for the
+v1.12.0 drivers, is recognised and removed the same way.
 
 For an application with a separate elevated lifecycle helper,
 `Controller::take_writer` delegates input publication and disables the
