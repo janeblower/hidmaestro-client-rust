@@ -590,12 +590,16 @@ fn driver_inf(xusb: bool) -> Result<std::path::PathBuf> {
     )
     .join("INF");
     for entry in std::fs::read_dir(directory)? {
-        let path = entry?.path();
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
         let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
         if !name.starts_with("oem") || !name.ends_with(".inf") {
             continue;
         }
-        let bytes = std::fs::read(&path)?;
+        // Another vendor's locked or broken INF says nothing about these packages.
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         let content = if bytes.starts_with(&[0xff, 0xfe]) {
             String::from_utf16_lossy(
                 &bytes[2..]
