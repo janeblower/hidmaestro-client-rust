@@ -9,7 +9,7 @@ packages, version **2.0.0.2201**: `hidmaestro.inf` and `hidmaestro_xusb.inf`.
 Install those separately using the upstream release instructions. This crate
 does not install drivers, create signing certificates or change Windows
 security settings. Driver source/protocol is pinned to upstream commit
-`0c5676fb482776b0ef7589dc4937f7dc9fc57c1c`. The client speaks driver
+`30b8faf0f7de746f249edc5f1520eaa0440965cf`. The client speaks driver
 protocol 4 (the v2.0.0 version contract) and uses protocol 5 removal when
 the driver offers it; creation fails if a started driver does not serve 4.
 
