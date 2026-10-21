@@ -7,7 +7,7 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{Ordering, fence},
+        atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
     },
 };
 use windows_sys::Win32::{
@@ -50,13 +50,23 @@ impl Drop for Security {
     }
 }
 
+/// Integers that the drivers and other processes may access concurrently.
+trait Shared {}
+impl Shared for AtomicU8 {}
+impl Shared for AtomicU16 {}
+impl Shared for AtomicI32 {}
+impl Shared for AtomicU32 {}
+impl Shared for AtomicU64 {}
+
 struct Mapping {
     view: MEMORY_MAPPED_VIEW_ADDRESS,
+    size: usize,
     _handle: Handle,
 }
 impl Mapping {
     fn from_handle(handle: Handle, size: u32) -> Result<Self> {
-        // The owned section handle stays live until the view is unmapped.
+        // MapViewOfFile fails unless the section has at least size bytes;
+        // the owned section handle stays live until the view is unmapped.
         let view = unsafe {
             MapViewOfFile(
                 handle.0,
@@ -71,12 +81,13 @@ impl Mapping {
         }
         Ok(Self {
             view,
+            size: size as usize,
             _handle: handle,
         })
     }
     fn create(name: &str, size: u32, sa: &SECURITY_ATTRIBUTES, reuse: bool) -> Result<Self> {
         // Pagefile-backed mapping; sa and name remain valid through the call.
-        unsafe {
+        let (handle, existed) = unsafe {
             let handle = Handle::new(CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 sa,
@@ -85,32 +96,38 @@ impl Mapping {
                 size,
                 wide(name).as_ptr(),
             ))?;
-            let existed = GetLastError() == ERROR_ALREADY_EXISTS;
-            if existed && !reuse {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    name.to_owned(),
-                ));
-            }
-            let view = MapViewOfFile(
-                handle.0,
-                FILE_MAP_READ | FILE_MAP_WRITE,
-                0,
-                0,
-                size as usize,
-            );
-            if view.Value.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            if existed {
-                // Recovery has verified ownership and removed the previous devices.
-                view.Value.cast::<u8>().write_bytes(0, size as usize);
-            }
-            Ok(Self {
-                view,
-                _handle: handle,
-            })
+            (handle, GetLastError() == ERROR_ALREADY_EXISTS)
+        };
+        if existed && !reuse {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                name.to_owned(),
+            ));
         }
+        let mapping = Self::from_handle(handle, size)?;
+        if existed {
+            // Recovery has verified ownership and removed the previous devices.
+            for offset in 0..mapping.size {
+                mapping.at::<AtomicU8>(offset).store(0, Ordering::Relaxed);
+            }
+        }
+        Ok(mapping)
+    }
+
+    /// Views the shared integer at offset; panics if it is out of bounds or misaligned.
+    fn at<T: Shared>(&self, offset: usize) -> &T {
+        assert!(offset <= self.size && size_of::<T>() <= self.size - offset);
+        let ptr = self
+            .view
+            .Value
+            .cast::<u8>()
+            .wrapping_add(offset)
+            .cast::<T>();
+        assert!(ptr.is_aligned());
+        // The view lives as long as self and the bounds are checked. Other
+        // mappings of the section change it behind our back, which atomics
+        // permit; no reference to plain data in the view is ever created.
+        unsafe { &*ptr }
     }
 }
 impl Drop for Mapping {
@@ -149,30 +166,20 @@ impl Version {
         // The drivers read the configuration under the contract only once
         // this half names protocol 4 and the devnodes' identity tag. The SDK
         // version is the HIDMaestro release whose contract this client speaks.
-        unsafe {
-            let view = version.0.view.Value.cast::<u8>();
-            for (offset, value) in [(0, 1), (4, CONTRACT_PROTOCOL), (8, CONTRACT_PROTOCOL)] {
-                view.add(offset).cast::<i32>().write_volatile(value);
-            }
-            for (i, part) in [2u16, 0, 0].into_iter().enumerate() {
-                view.add(12 + 2 * i).cast::<u16>().write_volatile(part);
-            }
-            view.add(48).cast::<u64>().write_volatile(tag);
+        let view = &version.0;
+        for (offset, value) in [(0, 1), (4, CONTRACT_PROTOCOL), (8, CONTRACT_PROTOCOL)] {
+            view.at::<AtomicI32>(offset).store(value, Ordering::Relaxed);
         }
+        for (i, part) in [2u16, 0, 0].into_iter().enumerate() {
+            view.at::<AtomicU16>(12 + 2 * i)
+                .store(part, Ordering::Relaxed);
+        }
+        view.at::<AtomicU64>(48).store(tag, Ordering::Relaxed);
         Ok(version)
     }
 
     fn read(&self, offset: usize) -> i32 {
-        // Offsets are 4-byte aligned within the live 64-byte view.
-        let value = unsafe {
-            self.0
-                .view
-                .Value
-                .cast::<u8>()
-                .add(offset)
-                .cast::<i32>()
-                .read_volatile()
-        };
+        let value = self.0.at::<AtomicI32>(offset).load(Ordering::Relaxed);
         // Each driver writes its protocol last; callers read it first, and this
         // fence orders that read before the fields read after it.
         fence(Ordering::SeqCst);
@@ -231,7 +238,7 @@ struct Publisher {
     closed: bool,
 }
 
-// The handles never change and the view is written only under `publisher`.
+// The handles never change and the view is accessed only through atomics.
 unsafe impl Send for Input {}
 unsafe impl Sync for Input {}
 
@@ -244,14 +251,8 @@ impl Input {
     }
 
     fn publish(&self, publisher: &mut Publisher, frame: &EncodedFrame) -> Result<()> {
-        // The mapping is live, page aligned and 362 bytes long; the guard
-        // makes this the only writer in the process.
+        write_frame(&self.mapping, &mut publisher.sequence, frame);
         unsafe {
-            write_frame(
-                self.mapping.view.Value.cast(),
-                &mut publisher.sequence,
-                frame,
-            );
             check(SetEvent(self.input_event.0))?;
             check(SetEvent(self.companion_event.0))
         }
@@ -284,7 +285,7 @@ impl Writer {
         let [input, input_event, companion_event] = handles.map(|h| Handle(h.into_raw_handle()));
         let mapping = Mapping::from_handle(input, 362)?;
         // The caller guarantees that the previous writer has stopped.
-        let sequence = unsafe { mapping.view.Value.cast::<u32>().read_volatile() };
+        let sequence = mapping.at::<AtomicU32>(0).load(Ordering::Relaxed);
         if sequence & 1 != 0 {
             return Err(io::Error::other("input writer stopped during publication"));
         }
@@ -328,8 +329,7 @@ impl Writer {
         let mut publisher = self.0.lock();
         publisher.closed = true;
         // A crashed writer may have stopped after publishing an odd sequence.
-        publisher.sequence =
-            unsafe { self.0.mapping.view.Value.cast::<u32>().read_volatile() } & !1;
+        publisher.sequence = self.0.mapping.at::<AtomicU32>(0).load(Ordering::Relaxed) & !1;
         let frame = crate::report::encode(&crate::State::default())?;
         self.0.publish(&mut publisher, &frame)
     }
@@ -475,31 +475,61 @@ impl Transport {
     }
 }
 
-unsafe fn write_frame(view: *mut u8, sequence: &mut u32, frame: &EncodedFrame) {
-    // SeqNo is page aligned; byte stores avoid references to shared/packed data.
-    unsafe {
-        view.cast::<u32>().write_volatile(sequence.wrapping_add(1));
-        fence(Ordering::SeqCst);
-        for (offset, data) in [
-            (4, 18u32.to_le_bytes().as_slice()),
-            (8, frame.hid.as_slice()),
-            (264, frame.gip.as_slice()),
-            (278, &[0; 4]),
-        ] {
-            for (i, byte) in data.iter().enumerate() {
-                view.add(offset + i).write_volatile(*byte);
-            }
+fn write_frame(input: &Mapping, sequence: &mut u32, frame: &EncodedFrame) {
+    let seq = input.at::<AtomicU32>(0);
+    seq.store(sequence.wrapping_add(1), Ordering::Relaxed);
+    fence(Ordering::SeqCst);
+    // The packed report fields are not aligned for wider stores.
+    for (offset, data) in [
+        (4, 18u32.to_le_bytes().as_slice()),
+        (8, frame.hid.as_slice()),
+        (264, frame.gip.as_slice()),
+        (278, &[0; 4]),
+    ] {
+        for (i, byte) in data.iter().enumerate() {
+            input
+                .at::<AtomicU8>(offset + i)
+                .store(*byte, Ordering::Relaxed);
         }
-        fence(Ordering::SeqCst);
-        *sequence = sequence.wrapping_add(2);
-        view.cast::<u32>().write_volatile(*sequence);
     }
+    fence(Ordering::SeqCst);
+    *sequence = sequence.wrapping_add(2);
+    seq.store(*sequence, Ordering::Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{State, report};
+
+    fn byte(mapping: &Mapping, offset: usize) -> u8 {
+        mapping.at::<AtomicU8>(offset).load(Ordering::Relaxed)
+    }
+
+    fn sequence(mapping: &Mapping) -> u32 {
+        mapping.at::<AtomicU32>(0).load(Ordering::Relaxed)
+    }
+
+    fn local(name: &str, size: u32) -> Mapping {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            ..Default::default()
+        };
+        let name = format!("Local\\HIDMaestro{name}Test{}", std::process::id());
+        Mapping::create(&name, size, &sa, false).unwrap()
+    }
+
+    #[test]
+    #[should_panic]
+    fn shared_access_past_the_view_panics() {
+        local("Bounds", 362).at::<AtomicU32>(360);
+    }
+
+    #[test]
+    #[should_panic]
+    fn misaligned_shared_access_panics() {
+        local("Align", 362).at::<AtomicU32>(2);
+    }
 
     #[test]
     fn identity_tag_matches_driver_contract() {
@@ -510,30 +540,22 @@ mod tests {
 
     #[test]
     fn version_half_names_contract_and_reads_driver_errors() {
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            ..Default::default()
+        let version = Version(local("Version", VERSION_SIZE));
+        let set = |offset, value| {
+            version
+                .0
+                .at::<AtomicI32>(offset)
+                .store(value, Ordering::Relaxed)
         };
-        let mapping = Mapping::create(
-            &format!("Local\\HIDMaestroVersionTest{}", std::process::id()),
-            VERSION_SIZE,
-            &sa,
-            false,
-        )
-        .unwrap();
-        let view = mapping.view.Value.cast::<u8>();
-        let version = Version(mapping);
         assert!(version.check("driver", 20, 36, 56).is_err());
-        unsafe {
-            view.add(36).cast::<i32>().write_volatile(4);
-            view.add(20).cast::<i32>().write_volatile(5);
-        }
+        set(36, 4);
+        set(20, 5);
         version.check("driver", 20, 36, 56).unwrap();
-        unsafe { view.add(56).cast::<i32>().write_volatile(1) };
+        set(56, 1);
         let error = version.check("driver", 20, 36, 56).unwrap_err();
         assert!(error.to_string().contains("FeatureAnswers"));
-        unsafe { view.add(36).cast::<i32>().write_volatile(5) };
-        unsafe { view.add(56).cast::<i32>().write_volatile(0) };
+        set(36, 5);
+        set(56, 0);
         assert!(version.check("driver", 20, 36, 56).is_err());
     }
 
@@ -545,13 +567,14 @@ mod tests {
         };
         let name = format!("Local\\HIDMaestroRetainedTest{}", std::process::id());
         let old = Mapping::create(&name, 8192, &sa, false).unwrap();
-        unsafe { old.view.Value.cast::<u8>().write_bytes(0xff, 8192) };
+        for offset in 0..8192 {
+            old.at::<AtomicU8>(offset).store(0xff, Ordering::Relaxed);
+        }
         assert!(Mapping::create(&name, 8192, &sa, false).is_err());
         assert!(Mapping::create(&name, 16384, &sa, true).is_err());
-        assert_eq!(unsafe { old.view.Value.cast::<u8>().read_volatile() }, 0xff);
+        assert_eq!(byte(&old, 0), 0xff);
         let reopened = Mapping::create(&name, 8192, &sa, true).unwrap();
-        let bytes = unsafe { std::slice::from_raw_parts(reopened.view.Value.cast::<u8>(), 8192) };
-        assert!(bytes.iter().all(|&byte| byte == 0));
+        assert!((0..8192).all(|offset| byte(&reopened, offset) == 0));
     }
 
     #[test]
@@ -585,10 +608,9 @@ mod tests {
                 ..State::default()
             })
             .unwrap();
-        let view = imported.0.mapping.view.Value.cast::<u8>();
+        assert_eq!(sequence(&imported.0.mapping), 4);
+        assert_eq!(byte(&imported.0.mapping, 276), 1);
         unsafe {
-            assert_eq!(view.cast::<u32>().read_volatile(), 4);
-            assert_eq!(view.add(276).read_volatile(), 1);
             assert_eq!(WaitForSingleObject(imported.0.input_event.0, 0), 0);
             assert_eq!(WaitForSingleObject(imported.0.companion_event.0, 0), 0);
         }
@@ -603,17 +625,13 @@ mod tests {
             false,
         )
         .unwrap();
-        let view = writer.0.mapping.view.Value.cast::<u8>();
+        let view = &writer.0.mapping;
         // Simulate a dead publisher with a partly written A press.
-        unsafe {
-            view.cast::<u32>().write_volatile(3);
-            view.add(276).write_volatile(1);
-        }
+        view.at::<AtomicU32>(0).store(3, Ordering::Relaxed);
+        view.at::<AtomicU8>(276).store(1, Ordering::Relaxed);
         writer.neutral().unwrap();
-        unsafe {
-            assert_eq!(view.cast::<u32>().read_volatile(), 4);
-            assert_eq!(view.add(276).read_volatile(), 0);
-        }
+        assert_eq!(sequence(&writer.0.mapping), 4);
+        assert_eq!(byte(&writer.0.mapping, 276), 0);
     }
 
     #[test]
@@ -631,35 +649,29 @@ mod tests {
             ..State::default()
         };
         shared.submit(&pressed).unwrap();
-        let view = owner.0.mapping.view.Value.cast::<u8>();
-        assert_eq!(unsafe { view.add(276).read_volatile() }, 1);
+        assert_eq!(byte(&owner.0.mapping, 276), 1);
         owner.neutral().unwrap();
         assert!(shared.submit(&pressed).is_err());
-        unsafe {
-            assert_eq!(view.cast::<u32>().read_volatile(), 4);
-            assert_eq!(view.add(276).read_volatile(), 0);
-        }
+        assert_eq!(sequence(&owner.0.mapping), 4);
+        assert_eq!(byte(&owner.0.mapping, 276), 0);
     }
 
     #[test]
     fn wire_layout_and_sequence_wrap() {
-        let mut memory = [0u32; 91];
-        let view = memory.as_mut_ptr().cast::<u8>();
+        let view = local("Wire", 362);
         let frame = report::encode(&State {
             left_trigger: 255,
             ..State::default()
         })
         .unwrap();
-        let mut sequence = 0xffff_fffe;
-        unsafe {
-            write_frame(view, &mut sequence, &frame);
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(view, 362) };
+        let mut next = 0xffff_fffe;
+        write_frame(&view, &mut next, &frame);
+        let bytes: Vec<u8> = (0..362).map(|offset| byte(&view, offset)).collect();
         assert_eq!(&bytes[0..4], &[0; 4]);
         assert_eq!(&bytes[4..8], &18u32.to_le_bytes());
         assert_eq!(&bytes[264 + 8..264 + 10], &1023u16.to_le_bytes());
         assert_eq!(&bytes[278..282], &[0; 4]);
-        assert_eq!(sequence, 0);
+        assert_eq!(next, 0);
     }
 
     #[test]
@@ -683,16 +695,10 @@ mod tests {
             .unwrap();
         drop(first);
         assert!(Transport::create().is_err());
-        assert_eq!(
-            unsafe { retained.view.Value.cast::<u8>().add(276).read_volatile() },
-            1
-        );
+        assert_eq!(byte(&retained, 276), 1);
         drop(pipe);
         assert!(Transport::create_with(identity_tag("HM_RUST_CLIENT_TEST"), || Ok(false)).is_err());
-        assert_eq!(
-            unsafe { retained.view.Value.cast::<u8>().add(276).read_volatile() },
-            1
-        );
+        assert_eq!(byte(&retained, 276), 1);
         drop(Transport::create().unwrap());
     }
 }
