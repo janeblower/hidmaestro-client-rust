@@ -35,8 +35,8 @@ impl Controller {
     /// Delegates input publication and disables this controller's `submit`.
     ///
     /// Closing the controller publishes neutral, after which the writer's
-    /// `submit` fails. Writers imported from its handles are not stopped; see
-    /// [`Writer::from_handles`].
+    /// `submit` fails. Writers imported from its handles are not stopped and
+    /// must stop themselves first; see [`Writer::from_handles`].
     pub fn take_writer(&mut self) -> Result<Writer> {
         self.0.take_writer()
     }
