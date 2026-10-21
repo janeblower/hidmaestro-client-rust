@@ -67,11 +67,12 @@ For an application with a separate elevated lifecycle helper,
 controller's `submit`. The returned `Writer` exposes borrowed handles for
 the input section and its two events. Duplicate only those handles into the
 application, then import them with `Writer::from_handles`; driver mappings
-do not need broader access permissions. Both operations are unsafe: there
-must be one active writer, and every delegated writer and its handles must
-be stopped and dropped before closing or dropping the controller. Cleanup
-then publishes neutral using the latest shared sequence, including recovery
-from a writer terminated midway through a frame.
+do not need broader access permissions. Closing the controller publishes
+neutral and makes the delegated writer's `submit` fail. Importing is unsafe:
+there must be one active writer, and every imported writer must be stopped
+and dropped before closing or dropping the controller. Cleanup publishes
+neutral using the latest shared sequence, including recovery from a writer
+terminated midway through a frame.
 
 If cleanup fails after releasing the transport, the controller retains its
 ownership lease and `Drop` retries removal and configuration cleanup.

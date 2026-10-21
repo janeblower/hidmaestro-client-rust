@@ -34,10 +34,10 @@ impl Controller {
     }
     /// Delegates input publication and disables this controller's `submit`.
     ///
-    /// # Safety
-    /// The returned writer and any imported copies must be stopped and dropped
-    /// before closing or dropping the controller. Only one copy may publish.
-    pub unsafe fn take_writer(&mut self) -> Result<Writer> {
+    /// Closing the controller publishes neutral, after which the writer's
+    /// `submit` fails. Writers imported from its handles are not stopped; see
+    /// [`Writer::from_handles`].
+    pub fn take_writer(&mut self) -> Result<Writer> {
         self.0.take_writer()
     }
     /// Neutralises input and removes the devices, reporting cleanup errors.
