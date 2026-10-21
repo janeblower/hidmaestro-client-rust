@@ -1,143 +1,26 @@
-use super::{Handle, check, wide};
+use super::sys::{Event, Mapping, Security, create_mutex, create_pipe};
 use crate::{Result, report::EncodedFrame};
 use std::{
     io,
-    mem::size_of,
-    os::windows::io::{BorrowedHandle, IntoRawHandle, OwnedHandle},
-    ptr,
+    os::windows::io::{BorrowedHandle, OwnedHandle},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
     },
 };
-use windows_sys::Win32::{
-    Foundation::{ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE, LocalFree},
-    Security::{
-        Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, SECURITY_ATTRIBUTES,
-    },
-    Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_OUTBOUND},
-    System::{Memory::*, Pipes::*, Threading::*},
-};
 
-struct Security(*mut std::ffi::c_void);
-impl Security {
-    fn new() -> Result<Self> {
-        let mut sd = ptr::null_mut();
-        // Windows allocates sd; Security releases it with LocalFree.
-        unsafe {
-            check(ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)").as_ptr(),
-                1,
-                &mut sd,
-                ptr::null_mut(),
-            ))?;
-        }
-        Ok(Self(sd))
-    }
-    fn attributes(&self) -> SECURITY_ATTRIBUTES {
-        SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: self.0,
-            bInheritHandle: 0,
-        }
-    }
-}
-impl Drop for Security {
-    fn drop(&mut self) {
-        unsafe {
-            LocalFree(self.0);
-        }
-    }
-}
+const SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)";
 
-/// Integers that the drivers and other processes may access concurrently.
-trait Shared {}
-impl Shared for AtomicU8 {}
-impl Shared for AtomicU16 {}
-impl Shared for AtomicI32 {}
-impl Shared for AtomicU32 {}
-impl Shared for AtomicU64 {}
-
-struct Mapping {
-    view: MEMORY_MAPPED_VIEW_ADDRESS,
-    size: usize,
-    _handle: Handle,
-}
-impl Mapping {
-    fn from_handle(handle: Handle, size: u32) -> Result<Self> {
-        // A returned view maps size writable bytes, possibly as the zeroed
-        // tail of a smaller section's last page; the owned section handle
-        // stays live until the view is unmapped.
-        let view = unsafe {
-            MapViewOfFile(
-                handle.0,
-                FILE_MAP_READ | FILE_MAP_WRITE,
-                0,
-                0,
-                size as usize,
-            )
-        };
-        if view.Value.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
-            view,
-            size: size as usize,
-            _handle: handle,
-        })
-    }
-    fn create(name: &str, size: u32, sa: &SECURITY_ATTRIBUTES, reuse: bool) -> Result<Self> {
-        // Pagefile-backed mapping; sa and name remain valid through the call.
-        let (handle, existed) = unsafe {
-            let handle = Handle::new(CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                sa,
-                PAGE_READWRITE,
-                0,
-                size,
-                wide(name).as_ptr(),
-            ))?;
-            (handle, GetLastError() == ERROR_ALREADY_EXISTS)
-        };
-        if existed && !reuse {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                name.to_owned(),
-            ));
-        }
-        let mapping = Self::from_handle(handle, size)?;
-        if existed {
-            // Recovery has verified ownership and removed the previous devices.
-            for offset in 0..mapping.size {
-                mapping.at::<AtomicU8>(offset).store(0, Ordering::Relaxed);
-            }
-        }
-        Ok(mapping)
-    }
-
-    /// Views the shared integer at offset; panics if it is out of bounds or misaligned.
-    fn at<T: Shared>(&self, offset: usize) -> &T {
-        assert!(offset <= self.size && size_of::<T>() <= self.size - offset);
-        let ptr = self
-            .view
-            .Value
-            .cast::<u8>()
-            .wrapping_add(offset)
-            .cast::<T>();
-        assert!(ptr.is_aligned());
-        // The view lives as long as self and the bounds are checked. Other
-        // mappings of the section change it behind our back, which atomics
-        // permit; no reference to plain data in the view is ever created.
-        unsafe { &*ptr }
-    }
-}
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        // No client code accesses the view after Mapping is dropped.
-        unsafe {
-            UnmapViewOfFile(self.view);
+/// Creates a section, or reopens and clears one retained by a recovered session.
+fn section(name: &str, size: u32, security: Option<&Security>, reuse: bool) -> Result<Mapping> {
+    let (mapping, existed) = Mapping::create(name, size, security, reuse)?;
+    if existed {
+        // Recovery has verified ownership and removed the previous devices.
+        for offset in 0..mapping.size() {
+            mapping.at::<AtomicU8>(offset).store(0, Ordering::Relaxed);
         }
     }
+    Ok(mapping)
 }
 
 // HIDMAESTRO_VERSION_INFO in driver/hm_contract.h of HIDMaestro v2.0.0.
@@ -157,11 +40,11 @@ pub(super) fn identity_tag(token: &str) -> u64 {
 
 struct Version(Mapping);
 impl Version {
-    fn create(sa: &SECURITY_ATTRIBUTES, reuse: bool, tag: u64) -> Result<Self> {
-        let version = Self(Mapping::create(
+    fn create(security: Option<&Security>, reuse: bool, tag: u64) -> Result<Self> {
+        let version = Self(section(
             "Global\\HIDMaestroVersion0",
             VERSION_SIZE,
-            sa,
+            security,
             reuse,
         )?);
         // The drivers read the configuration under the contract only once
@@ -211,26 +94,24 @@ impl Version {
     }
 }
 
-fn event(name: &str, sa: &SECURITY_ATTRIBUTES, reuse: bool) -> Result<Handle> {
-    unsafe {
-        let h = Handle::new(CreateEventW(sa, 0, 0, wide(name).as_ptr()))?;
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            if !reuse {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    name.to_owned(),
-                ));
-            }
-            check(ResetEvent(h.0))?;
+fn event(name: &str, security: Option<&Security>, reuse: bool) -> Result<Event> {
+    let (event, existed) = Event::create(name, security, false)?;
+    if existed {
+        if !reuse {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                name.to_owned(),
+            ));
         }
-        Ok(h)
+        event.reset()?;
     }
+    Ok(event)
 }
 
 struct Input {
     mapping: Mapping,
-    input_event: Handle,
-    companion_event: Handle,
+    input_event: Event,
+    companion_event: Event,
     publisher: Mutex<Publisher>,
 }
 
@@ -238,10 +119,6 @@ struct Publisher {
     sequence: u32,
     closed: bool,
 }
-
-// The handles never change and the view is accessed only through atomics.
-unsafe impl Send for Input {}
-unsafe impl Sync for Input {}
 
 impl Input {
     fn lock(&self) -> MutexGuard<'_, Publisher> {
@@ -253,10 +130,8 @@ impl Input {
 
     fn publish(&self, publisher: &mut Publisher, frame: &EncodedFrame) -> Result<()> {
         write_frame(&self.mapping, &mut publisher.sequence, frame);
-        unsafe {
-            check(SetEvent(self.input_event.0))?;
-            check(SetEvent(self.companion_event.0))
-        }
+        self.input_event.set()?;
+        self.companion_event.set()
     }
 }
 
@@ -264,11 +139,15 @@ impl Input {
 pub struct Writer(Arc<Input>);
 
 impl Writer {
-    fn create(name: &str, sa: &SECURITY_ATTRIBUTES, reuse: bool) -> Result<Self> {
+    fn create(name: &str, security: Option<&Security>, reuse: bool) -> Result<Self> {
         Ok(Self(Arc::new(Input {
-            mapping: Mapping::create(name, 362, sa, reuse)?,
-            companion_event: event(&name.replace("Input", "CompanionInputEvent"), sa, reuse)?,
-            input_event: event(&name.replace("Input", "InputEvent"), sa, reuse)?,
+            mapping: section(name, 362, security, reuse)?,
+            companion_event: event(
+                &name.replace("Input", "CompanionInputEvent"),
+                security,
+                reuse,
+            )?,
+            input_event: event(&name.replace("Input", "InputEvent"), security, reuse)?,
             publisher: Mutex::new(Publisher {
                 sequence: 0,
                 closed: false,
@@ -286,7 +165,7 @@ impl Writer {
     /// the controller, which publishes neutral when it closes. Otherwise the
     /// drivers may read torn frames; memory safety does not depend on it.
     pub fn from_handles(handles: [OwnedHandle; 3]) -> Result<Self> {
-        let [input, input_event, companion_event] = handles.map(|h| Handle(h.into_raw_handle()));
+        let [input, input_event, companion_event] = handles;
         let mapping = Mapping::from_handle(input, 362)?;
         let sequence = mapping.at::<AtomicU32>(0).load(Ordering::Relaxed);
         if sequence & 1 != 0 {
@@ -294,8 +173,8 @@ impl Writer {
         }
         Ok(Self(Arc::new(Input {
             mapping,
-            input_event,
-            companion_event,
+            input_event: input_event.into(),
+            companion_event: companion_event.into(),
             publisher: Mutex::new(Publisher {
                 sequence,
                 closed: false,
@@ -305,15 +184,11 @@ impl Writer {
 
     /// Returns the section and two events for duplication into another process.
     pub fn handles(&self) -> [BorrowedHandle<'_>; 3] {
-        // These handles are owned by self for the lifetime of the borrows.
-        unsafe {
-            [
-                self.0.mapping._handle.0,
-                self.0.input_event.0,
-                self.0.companion_event.0,
-            ]
-            .map(|h| BorrowedHandle::borrow_raw(h))
-        }
+        [
+            self.0.mapping.handle(),
+            self.0.input_event.handle(),
+            self.0.companion_event.handle(),
+        ]
     }
 
     /// Publishes a validated state and wakes both driver input paths.
@@ -350,14 +225,14 @@ pub(super) struct Transport {
     writer: Writer,
     delegated: bool,
     _output: Mapping,
-    _output_event: Handle,
+    _output_event: Event,
     _ack: Mapping,
-    _ack_event: Handle,
+    _ack_event: Event,
     version: Version,
-    remove_event: Handle,
-    removed_event: Handle,
-    _pipes: Vec<Handle>,
-    _mutex: Handle,
+    remove_event: Event,
+    removed_event: Event,
+    _pipes: Vec<OwnedHandle>,
+    _mutex: OwnedHandle,
 }
 
 impl Transport {
@@ -367,54 +242,30 @@ impl Transport {
     }
 
     pub fn create_with(tag: u64, recover: impl FnOnce() -> Result<bool>) -> Result<Self> {
-        let sd = Security::new()?;
-        let sa = sd.attributes();
-        let mutex = unsafe {
-            let h = Handle::new(CreateMutexW(
-                &sa,
-                0,
-                wide("Global\\HIDMaestroRustController0").as_ptr(),
-            ))?;
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "controller is already owned",
-                ));
-            }
-            h
-        };
-        let reuse = recover()?;
-        let mut pipes = Vec::new();
-        for i in 0..2 {
-            let flags = PIPE_ACCESS_OUTBOUND
-                | if i == 0 {
-                    FILE_FLAG_FIRST_PIPE_INSTANCE
-                } else {
-                    0
-                };
-            // A restarted HID driver needs a second pipe instance to reconnect.
-            pipes.push(unsafe {
-                Handle::new(CreateNamedPipeW(
-                    wide(r"\\.\pipe\HIDMaestroOwner0").as_ptr(),
-                    flags,
-                    PIPE_REJECT_REMOTE_CLIENTS,
-                    2,
-                    0,
-                    0,
-                    0,
-                    &sa,
-                ))?
-            });
+        let sd = Security::new(SDDL)?;
+        let sa = Some(&sd);
+        let (mutex, existed) = create_mutex("Global\\HIDMaestroRustController0", sa)?;
+        if existed {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "controller is already owned",
+            ));
         }
-        let output = Mapping::create("Global\\HIDMaestroOutput0", 8 + 64 * 264, &sa, reuse)?;
-        let ack = Mapping::create("Global\\HIDMaestroInputAck0", 16 + 8 * 84, &sa, reuse)?;
-        let output_event = event("Global\\HIDMaestroOutputEvent0", &sa, reuse)?;
-        let ack_event = event("Global\\HIDMaestroInputAckEvent0", &sa, reuse)?;
-        let remove_event = event("Global\\HIDMaestroRemoveEvent0", &sa, reuse)?;
-        let removed_event = event("Global\\HIDMaestroRemovedEvent0", &sa, reuse)?;
-        let version = Version::create(&sa, reuse, tag)?;
+        let reuse = recover()?;
+        // A restarted HID driver needs a second pipe instance to reconnect.
+        let pipes = [true, false]
+            .into_iter()
+            .map(|first| create_pipe(r"\\.\pipe\HIDMaestroOwner0", first, sa))
+            .collect::<Result<_>>()?;
+        let output = section("Global\\HIDMaestroOutput0", 8 + 64 * 264, sa, reuse)?;
+        let ack = section("Global\\HIDMaestroInputAck0", 16 + 8 * 84, sa, reuse)?;
+        let output_event = event("Global\\HIDMaestroOutputEvent0", sa, reuse)?;
+        let ack_event = event("Global\\HIDMaestroInputAckEvent0", sa, reuse)?;
+        let remove_event = event("Global\\HIDMaestroRemoveEvent0", sa, reuse)?;
+        let removed_event = event("Global\\HIDMaestroRemovedEvent0", sa, reuse)?;
+        let version = Version::create(sa, reuse, tag)?;
         // The driver opens the other objects once, when the input event first opens.
-        let writer = Writer::create("Global\\HIDMaestroInput0", &sa, reuse)?;
+        let writer = Writer::create("Global\\HIDMaestroInput0", sa, reuse)?;
         Ok(Self {
             writer,
             delegated: false,
@@ -447,11 +298,9 @@ impl Transport {
             return false;
         }
         // A stale answer to an earlier request is not this one.
-        unsafe {
-            ResetEvent(self.removed_event.0) != 0
-                && SetEvent(self.remove_event.0) != 0
-                && WaitForSingleObject(self.removed_event.0, 2000) == 0
-        }
+        self.removed_event.reset().is_ok()
+            && self.remove_event.set().is_ok()
+            && self.removed_event.wait(2000).unwrap_or(false)
     }
 
     pub fn publish(&mut self, frame: &EncodedFrame) -> Result<()> {
@@ -473,7 +322,7 @@ impl Transport {
         self.writer.neutral()
     }
 
-    pub fn release(self) -> Handle {
+    pub fn release(self) -> OwnedHandle {
         self._mutex
     }
 }
@@ -503,8 +352,9 @@ fn write_frame(input: &Mapping, sequence: &mut u32, frame: &EncodedFrame) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{State, report};
-    use windows_sys::Win32::Foundation::DuplicateHandle;
+    use crate::{State, report, windows::sys::duplicate};
+    use std::os::windows::io::AsHandle;
+    use windows_sys::Win32::System::Memory::FILE_MAP_READ;
 
     fn byte(mapping: &Mapping, offset: usize) -> u8 {
         mapping.at::<AtomicU8>(offset).load(Ordering::Relaxed)
@@ -514,13 +364,16 @@ mod tests {
         mapping.at::<AtomicU32>(0).load(Ordering::Relaxed)
     }
 
-    fn local(name: &str, size: u32) -> Mapping {
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            ..Default::default()
-        };
-        let name = format!("Local\\HIDMaestro{name}Test{}", std::process::id());
-        Mapping::create(&name, size, &sa, false).unwrap()
+    fn name(what: &str) -> String {
+        format!("Local\\HIDMaestro{what}Test{}", std::process::id())
+    }
+
+    fn local(what: &str, size: u32) -> Mapping {
+        section(&name(what), size, None, false).unwrap()
+    }
+
+    fn owned(handle: BorrowedHandle<'_>) -> OwnedHandle {
+        handle.try_clone_to_owned().unwrap()
     }
 
     #[test]
@@ -565,44 +418,34 @@ mod tests {
 
     #[test]
     fn retained_mapping_is_reset_on_reopen() {
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            ..Default::default()
-        };
-        let name = format!("Local\\HIDMaestroRetainedTest{}", std::process::id());
-        let old = Mapping::create(&name, 8192, &sa, false).unwrap();
+        let name = name("Retained");
+        let old = section(&name, 8192, None, false).unwrap();
         for offset in 0..8192 {
             old.at::<AtomicU8>(offset).store(0xff, Ordering::Relaxed);
         }
-        assert!(Mapping::create(&name, 8192, &sa, false).is_err());
-        assert!(Mapping::create(&name, 16384, &sa, true).is_err());
+        assert!(section(&name, 8192, None, false).is_err());
+        assert!(section(&name, 16384, None, true).is_err());
         assert_eq!(byte(&old, 0), 0xff);
-        let reopened = Mapping::create(&name, 8192, &sa, true).unwrap();
+        let reopened = section(&name, 8192, None, true).unwrap();
         assert!((0..8192).all(|offset| byte(&reopened, offset) == 0));
     }
 
     #[test]
     fn retained_event_is_reset_on_reopen() {
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            ..Default::default()
-        };
-        let name = format!("Local\\HIDMaestroRetainedEventTest{}", std::process::id());
-        let old = event(&name, &sa, false).unwrap();
-        check(unsafe { SetEvent(old.0) }).unwrap();
-        assert!(event(&name, &sa, false).is_err());
-        let reopened = event(&name, &sa, true).unwrap();
-        assert_eq!(unsafe { WaitForSingleObject(reopened.0, 0) }, 258);
+        let name = name("RetainedEvent");
+        let old = event(&name, None, false).unwrap();
+        old.set().unwrap();
+        assert!(event(&name, None, false).is_err());
+        let reopened = event(&name, None, true).unwrap();
+        assert!(!reopened.wait(0).unwrap());
     }
 
     #[test]
     fn imported_writer_continues_sequence_and_signals_both_events() {
-        let sd = Security::new().unwrap();
-        let sa = sd.attributes();
-        let name = format!("Local\\HIDMaestroInputTest{}", std::process::id());
-        let mut writer = Writer::create(&name, &sa, false).unwrap();
+        let sd = Security::new(SDDL).unwrap();
+        let mut writer = Writer::create(&name("Input"), Some(&sd), false).unwrap();
         writer.submit(&State::default()).unwrap();
-        let handles = writer.handles().map(|h| h.try_clone_to_owned().unwrap());
+        let handles = writer.handles().map(owned);
         drop(writer);
         let mut imported = Writer::from_handles(handles).unwrap();
         imported
@@ -613,76 +456,40 @@ mod tests {
             .unwrap();
         assert_eq!(sequence(&imported.0.mapping), 4);
         assert_eq!(byte(&imported.0.mapping, 276), 1);
-        unsafe {
-            assert_eq!(WaitForSingleObject(imported.0.input_event.0, 0), 0);
-            assert_eq!(WaitForSingleObject(imported.0.companion_event.0, 0), 0);
-        }
-    }
-
-    fn owned(handle: &Handle) -> OwnedHandle {
-        unsafe { BorrowedHandle::borrow_raw(handle.0) }
-            .try_clone_to_owned()
-            .unwrap()
+        assert!(imported.0.input_event.wait(0).unwrap());
+        assert!(imported.0.companion_event.wait(0).unwrap());
     }
 
     #[test]
     fn import_rejects_what_is_not_a_writable_section() {
-        let sd = Security::new().unwrap();
-        let sa = sd.attributes();
-        let name = |what| format!("Local\\HIDMaestroImport{what}Test{}", std::process::id());
-        let section = Mapping::create(&name("Input"), 362, &sa, false).unwrap();
-        let input = event(&name("InputEvent"), &sa, false).unwrap();
-        let companion = event(&name("Companion"), &sa, false).unwrap();
-        let mut read_only = ptr::null_mut();
-        check(unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                section._handle.0,
-                GetCurrentProcess(),
-                &mut read_only,
-                FILE_MAP_READ,
-                0,
-                0,
-            )
-        })
-        .unwrap();
-        let read_only = Handle(read_only);
-        for wrong in [&input, &read_only] {
-            assert!(
-                Writer::from_handles([owned(wrong), owned(&input), owned(&companion)]).is_err()
-            );
+        let sd = Security::new(SDDL).unwrap();
+        let sa = Some(&sd);
+        let section = section(&name("ImportInput"), 362, sa, false).unwrap();
+        let input = event(&name("ImportInputEvent"), sa, false).unwrap();
+        let companion = event(&name("ImportCompanion"), sa, false).unwrap();
+        let read_only = duplicate(section.handle(), FILE_MAP_READ).unwrap();
+        for wrong in [input.handle(), read_only.as_handle()] {
+            let handles = [
+                owned(wrong),
+                owned(input.handle()),
+                owned(companion.handle()),
+            ];
+            assert!(Writer::from_handles(handles).is_err());
         }
     }
 
     #[test]
     fn import_with_wrong_events_fails_to_submit() {
-        let sd = Security::new().unwrap();
-        let sa = sd.attributes();
-        let name = |what| {
-            format!(
-                "Local\\HIDMaestroWrongEvents{what}Test{}",
-                std::process::id()
-            )
-        };
-        let section = Mapping::create(&name("Input"), 362, &sa, false).unwrap();
-        let mut writer = Writer::from_handles([
-            owned(&section._handle),
-            owned(&section._handle),
-            owned(&section._handle),
-        ])
-        .unwrap();
+        let sd = Security::new(SDDL).unwrap();
+        let section = section(&name("WrongEventsInput"), 362, Some(&sd), false).unwrap();
+        let mut writer = Writer::from_handles([(); 3].map(|_| owned(section.handle()))).unwrap();
         assert!(writer.submit(&State::default()).is_err());
     }
 
     #[test]
     fn neutral_recovers_a_writer_killed_mid_frame() {
-        let sd = Security::new().unwrap();
-        let mut writer = Writer::create(
-            &format!("Local\\HIDMaestroInputCrashTest{}", std::process::id()),
-            &sd.attributes(),
-            false,
-        )
-        .unwrap();
+        let sd = Security::new(SDDL).unwrap();
+        let mut writer = Writer::create(&name("InputCrash"), Some(&sd), false).unwrap();
         let view = &writer.0.mapping;
         // Simulate a dead publisher with a partly written A press.
         view.at::<AtomicU32>(0).store(3, Ordering::Relaxed);
@@ -694,13 +501,8 @@ mod tests {
 
     #[test]
     fn shared_writer_stops_once_the_owner_publishes_neutral() {
-        let sd = Security::new().unwrap();
-        let mut owner = Writer::create(
-            &format!("Local\\HIDMaestroInputShareTest{}", std::process::id()),
-            &sd.attributes(),
-            false,
-        )
-        .unwrap();
+        let sd = Security::new(SDDL).unwrap();
+        let mut owner = Writer::create(&name("InputShare"), Some(&sd), false).unwrap();
         let mut shared = owner.share();
         let pressed = State {
             buttons: crate::Buttons::A,
@@ -746,11 +548,8 @@ mod tests {
             )
             .unwrap();
         assert!(Transport::create().is_err());
-        let input = first.writer.handles()[0].try_clone_to_owned().unwrap();
-        let retained = Mapping::from_handle(Handle(input.into_raw_handle()), 362).unwrap();
-        let pipe = unsafe { BorrowedHandle::borrow_raw(first._pipes[0].0) }
-            .try_clone_to_owned()
-            .unwrap();
+        let retained = Mapping::from_handle(owned(first.writer.handles()[0]), 362).unwrap();
+        let pipe = first._pipes[0].try_clone().unwrap();
         drop(first);
         assert!(Transport::create().is_err());
         assert_eq!(byte(&retained, 276), 1);
