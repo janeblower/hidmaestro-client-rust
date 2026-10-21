@@ -1,5 +1,5 @@
 The Xbox 360 wire format and Windows lifecycle are derived from HIDMaestro
-v1.12.0, commit b4d29d9f4b1b91ced6b4755f095184b66339b8be:
+v2.0.0, commit 30b8faf0f7de746f249edc5f1520eaa0440965cf:
 https://github.com/hifihedgehog/HIDMaestro
 
 MIT License

@@ -1,4 +1,8 @@
-use super::{Handle, check, transport::Transport, wide};
+use super::{
+    Handle, check,
+    transport::{Transport, identity_tag},
+    wide,
+};
 use crate::{Result, State, report};
 use std::{
     collections::BTreeMap,
@@ -23,6 +27,9 @@ use windows_sys::{
 
 const CONFIG: &str = r"SOFTWARE\HIDMaestro\Controller0";
 const JOURNAL: &str = r"SOFTWARE\HIDMaestroRustClient\Controller0";
+// Both drivers find the index of the devnodes ending in TOKEN here before they start.
+const IDENTITY: &str = r"SOFTWARE\HIDMaestro\Identity\HM_RUST_CLIENT_0";
+const TOKEN: &str = "HM_RUST_CLIENT_0";
 const OWNER: &str = "hidmaestro-client-rust/v1/xbox360";
 const SWD_HARDWARE: &str = "root\\VID_045E&PID_028E&XI_00\0root\\HIDMaestroXUSB\0";
 const ROOT_ID: &str = r"ROOT\VID_045E&PID_028E&IG_00\HM_RUST_CLIENT_0";
@@ -238,7 +245,6 @@ fn configuration() -> BTreeMap<String, (u32, Vec<u8>)> {
     let mut values = BTreeMap::new();
     for (name, text) in [
         ("RustClientOwner", OWNER),
-        ("DeviceInstanceId", ROOT_ID),
         ("ProductString", NAME),
         ("DeviceDescription", NAME),
     ] {
@@ -251,11 +257,108 @@ fn configuration() -> BTreeMap<String, (u32, Vec<u8>)> {
         ("VersionNumber", 0x0100),
         ("Bluetooth", 0),
         ("InputReportByteLength", 18),
+        ("XusbCompanion", 1),
     ] {
         values.insert(name.into(), (REG_DWORD, value.to_le_bytes().to_vec()));
     }
-    values.insert("ReportDescriptor".into(), (REG_BINARY, DESCRIPTOR.to_vec()));
+    // The descriptor declares no report ID; the length is 18 bytes.
+    let report_id = [&[0], &18u32.to_le_bytes()[..], &DESCRIPTOR].concat();
+    // An empty table: format 4 header with no answers (FeatureStubTable.EmptyBlob).
+    let feature_answers = [&16u32.to_le_bytes()[..], &4u32.to_le_bytes(), &[0; 8]].concat();
+    for (name, bytes) in [
+        ("ReportDescriptor", DESCRIPTOR.to_vec()),
+        ("InputReportId", report_id),
+        ("FeatureAnswers", feature_answers),
+        ("CachedInputReportIds", Vec::new()),
+        ("XusbAnswers", xusb_answers()),
+    ] {
+        values.insert(name.into(), (REG_BINARY, bytes));
+    }
     values
+}
+
+fn identity_entry() -> BTreeMap<String, (u32, Vec<u8>)> {
+    BTreeMap::from([(
+        "ControllerIndex".into(),
+        (REG_DWORD, 0u32.to_le_bytes().to_vec()),
+    )])
+}
+
+/// The configuration a client built for HIDMaestro v1.12.0 left behind.
+fn legacy_configuration() -> BTreeMap<String, (u32, Vec<u8>)> {
+    let mut values = configuration();
+    for name in [
+        "XusbCompanion",
+        "InputReportId",
+        "FeatureAnswers",
+        "CachedInputReportIds",
+        "XusbAnswers",
+    ] {
+        values.remove(name);
+    }
+    values.insert("DeviceInstanceId".into(), (REG_SZ, utf16_bytes(ROOT_ID)));
+    values
+}
+
+/// The XUSB companion's IOCTL answers for a wired Xbox 360 pad on index 0.
+///
+/// HIDMaestro v2.0.0 profiles/models/xusb-companion.json with its defaults
+/// (gamepad subtype, voice and PMD flags, wired full battery) and 045E:028E
+/// substituted, laid out as XusbAnswers.Build: a header of length, format 4
+/// and count, 12-byte entries of IOCTL, minimum output, mode, arena offset
+/// and size, then the arena.
+fn xusb_answers() -> Vec<u8> {
+    const EXACT: u16 = 0;
+    const UP_TO: u16 = 1;
+    let mut information_ex = [0u8; 64];
+    information_ex[..12].copy_from_slice(&[3, 1, 1, 1, 0, 0, 0, 0, 0x5e, 0x04, 0x8e, 0x02]);
+    let answers: [(u32, u16, u16, &[u8]); 5] = [
+        (
+            0x8000_6000,
+            0,
+            EXACT,
+            &[3, 1, 1, 0, 0, 0, 0, 0, 0x5e, 0x04, 0x8e, 0x02],
+        ),
+        (
+            0x8000_e004,
+            0,
+            EXACT,
+            &[
+                3, 1, 0, 1, 0xff, 0xf7, 0xff, 0xff, 0xc0, 0xff, 0xc0, 0xff, 0xc0, 0xff, 0xc0, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0, 0, 0xff, 0xff,
+            ],
+        ),
+        (
+            0x8000_e004,
+            36,
+            EXACT,
+            &[
+                3, 1, 1, 1, 0x0c, 0, 0x5e, 0x04, 0x8e, 0x02, 0x10, 0x01, 0, 0xfa, 0x34, 0x22, 0xff,
+                0xf7, 0xff, 0xff, 0xc0, 0xff, 0xc0, 0xff, 0xc0, 0xff, 0xc0, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0, 0, 0xff, 0xff,
+            ],
+        ),
+        (0x8000_e018, 0, EXACT, &[0, 0, 1, 3]),
+        (0x8000_e3fc, 0, UP_TO, &information_ex),
+    ];
+    let arena_start = 12 + 12 * answers.len();
+    let length = arena_start + answers.iter().map(|a| a.3.len()).sum::<usize>();
+    let mut blob = Vec::with_capacity(length);
+    for value in [length as u32, 4, answers.len() as u32] {
+        blob.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut offset = 0;
+    for (code, min_output, mode, data) in answers {
+        blob.extend_from_slice(&code.to_le_bytes());
+        for value in [min_output, mode, offset, data.len() as u16] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        offset += data.len() as u16;
+    }
+    for (.., data) in answers {
+        blob.extend_from_slice(data);
+    }
+    blob
 }
 
 fn transport_retained() -> Result<bool> {
@@ -274,6 +377,9 @@ fn transport_retained() -> Result<bool> {
         "CompanionInputEvent",
         "OutputEvent",
         "InputAckEvent",
+        "RemoveEvent",
+        "RemovedEvent",
+        "Version",
     ] {
         let is_event = name.ends_with("Event");
         let name = wide(&format!("Global\\HIDMaestro{name}0"));
@@ -421,11 +527,11 @@ fn verify_bound(id: &str, expected_inf: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_root() -> Result<()> {
-    remove_node(ROOT_ID, HARDWARE)
+fn remove_root(transport: Option<&Transport>) -> Result<()> {
+    remove_node(ROOT_ID, HARDWARE, transport)
 }
 
-fn remove_node(id: &str, hardware_ids: &str) -> Result<()> {
+fn remove_node(id: &str, hardware_ids: &str, transport: Option<&Transport>) -> Result<()> {
     let set = DeviceSet::new()?;
     let data = match set.open(id) {
         Ok(d) => d,
@@ -477,10 +583,37 @@ fn remove_node(id: &str, hardware_ids: &str) -> Result<()> {
             "enumerate owned children: {rc:#x}"
         )));
     }
+    if let Some(transport) = transport
+        && present(id)
+    {
+        // Watchers close their handles on a removal query. When a holder
+        // refuses, DIF_REMOVE would leave the HID child's record without its
+        // driver; the driver instead fails the device as an unplug does.
+        let removed = unsafe {
+            CM_Query_And_Remove_SubTreeW(
+                data.DevInst,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                CM_REMOVE_UI_NOT_OK | CM_REMOVE_NO_RESTART,
+            )
+        } == CR_SUCCESS;
+        #[cfg(test)]
+        tests::QUERY_REMOVED.set(Some(removed));
+        if !removed {
+            let _ejected = transport.eject();
+            #[cfg(test)]
+            tests::EJECTED.set(_ejected);
+        }
+    }
     for child in children {
         if !absent(&child) {
-            let data = set.open(&child)?;
-            check(unsafe { SetupDiCallClassInstaller(DIF_REMOVE, set.0, &data) })?;
+            // An ejected device's children can leave between the check and the open.
+            match set.open(&child) {
+                Ok(data) => check(unsafe { SetupDiCallClassInstaller(DIF_REMOVE, set.0, &data) })?,
+                Err(_) if absent(&child) => {}
+                Err(e) => return Err(e),
+            }
         }
         wait_for(|| absent(&child), "owned child removal")?;
     }
@@ -531,6 +664,20 @@ fn recover() -> Result<bool> {
     } else {
         None
     };
+    let identity = Key::open(IDENTITY)?;
+    if let Some(key) = &identity {
+        if journal.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "identity entry has no ownership record",
+            ));
+        }
+        if key.snapshot()? != identity_entry() {
+            return Err(io::Error::other(
+                "identity entry was modified; preserving it",
+            ));
+        }
+    }
     if let Some(key) = Key::open(CONFIG)? {
         if !key.owned()? {
             return Err(io::Error::new(
@@ -550,9 +697,9 @@ fn recover() -> Result<bool> {
                 "XUSB instance still has an owner",
             ));
         }
-        remove_root()?;
+        remove_root(None)?;
         if let Some(id) = &recorded {
-            remove_node(id, SWD_HARDWARE)?;
+            remove_node(id, SWD_HARDWARE, None)?;
         }
         status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(CONFIG).as_ptr()) })?;
     }
@@ -560,11 +707,15 @@ fn recover() -> Result<bool> {
         if recorded.as_deref().is_some_and(present) {
             return Err(io::Error::other("recorded companion is still present"));
         }
-        remove_root()?;
+        remove_root(None)?;
         if let Some(id) = &recorded {
-            remove_node(id, SWD_HARDWARE)?;
+            remove_node(id, SWD_HARDWARE, None)?;
             status(unsafe { RegDeleteValueW(key.0, wide("CompanionInstanceId").as_ptr()) })?;
         }
+    }
+    if identity.is_some() {
+        drop(identity);
+        status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(IDENTITY).as_ptr()) })?;
     }
     if !absent(ROOT_ID) {
         return Err(io::Error::new(
@@ -578,13 +729,16 @@ fn recover() -> Result<bool> {
 /// Creation records the companion in the journal before the configuration, so a
 /// configuration without it is an interrupted creation rather than a foreign edit.
 fn recoverable(config: &BTreeMap<String, (u32, Vec<u8>)>, recorded: Option<&str>) -> bool {
-    let expected = configuration();
-    let Some(id) = recorded else {
-        return *config == expected;
-    };
-    let mut with_id = expected.clone();
-    with_id.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
-    *config == with_id || *config == expected
+    [configuration(), legacy_configuration()]
+        .into_iter()
+        .any(|expected| {
+            let Some(id) = recorded else {
+                return *config == expected;
+            };
+            let mut with_id = expected.clone();
+            with_id.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
+            *config == with_id || *config == expected
+        })
 }
 
 fn driver_inf(xusb: bool) -> Result<std::path::PathBuf> {
@@ -621,7 +775,7 @@ fn driver_inf(xusb: bool) -> Result<std::path::PathBuf> {
         } else {
             "hidmaestro.dll"
         };
-        if compact.contains("driverver=10/13/2026,1.12.0.2302")
+        if compact.contains("driverver=10/19/2026,2.0.0.2201")
             && compact.contains(binary)
             && compact.contains("hidmaestro")
         {
@@ -630,7 +784,7 @@ fn driver_inf(xusb: bool) -> Result<std::path::PathBuf> {
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "install HIDMaestro v1.12.0 driver packages first",
+        "install HIDMaestro v2.0.0 driver packages first",
     ))
 }
 
@@ -678,7 +832,7 @@ unsafe extern "system" fn created(
 }
 
 fn create_companion() -> Result<SoftwareDevice> {
-    let instance = wide("HM_RUST_CLIENT_0");
+    let instance = wide(TOKEN);
     let hardware = wide(SWD_HARDWARE);
     let compatible = wide(
         "USB\\MS_COMP_XUSB10\0USB\\Class_FF&SubClass_5D&Prot_01\0USB\\Class_FF&SubClass_5D\0USB\\Class_FF\0",
@@ -743,6 +897,7 @@ pub(crate) struct Backend {
     companion: Option<SoftwareDevice>,
     root: bool,
     config: bool,
+    identity: bool,
     transport: Option<Transport>,
     lease: Option<Handle>,
     expected: BTreeMap<String, (u32, Vec<u8>)>,
@@ -755,11 +910,12 @@ impl Backend {
         elevated()?;
         let inf = driver_inf(false)?;
         let companion_inf = driver_inf(true)?;
-        let transport = Transport::create_with(recover)?;
+        let transport = Transport::create_with(identity_tag(TOKEN), recover)?;
         let mut this = Self {
             companion: None,
             root: false,
             config: false,
+            identity: false,
             transport: Some(transport),
             lease: None,
             expected: BTreeMap::new(),
@@ -795,6 +951,12 @@ impl Backend {
             this.journal = true;
             journal.text("RustClientOwner", OWNER)?;
             drop(journal);
+            let identity = Key::create(IDENTITY)?;
+            this.identity = true;
+            for (name, (kind, bytes)) in identity_entry() {
+                identity.set(&name, kind, &bytes)?;
+            }
+            drop(identity);
             this.submit(&State::default())?;
             this.create_root(&inf)
                 .map_err(|e| io::Error::new(e.kind(), format!("HID setup: {e}")))?;
@@ -816,7 +978,14 @@ impl Backend {
                 .text("CompanionInstanceId", id)?;
             this.expected
                 .insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
-            wait_for(|| companion_ready(id), "XUSB interface start")?;
+            let transport = this
+                .transport
+                .as_ref()
+                .ok_or_else(|| io::Error::other("controller is closed"))?;
+            // A companion that failed its start names the value it could not read.
+            let started = wait_for(|| companion_ready(id), "XUSB interface start");
+            transport.check_companion()?;
+            started?;
             verify_bound(id, &companion_inf)?;
             verify_bound(ROOT_ID, &inf)?;
             Ok(())
@@ -911,7 +1080,7 @@ impl Backend {
                 "Windows requires a restart to start the HID device",
             ));
         }
-        wait_for(
+        let started = wait_for(
             || {
                 let mut child = 0;
                 let mut state = 0;
@@ -924,7 +1093,13 @@ impl Backend {
                 }
             },
             "HID child start",
-        )
+        );
+        // The driver writes its half at add, before HID class creates the child.
+        self.transport
+            .as_ref()
+            .ok_or_else(|| io::Error::other("controller is closed"))?
+            .check_driver()?;
+        started
     }
 
     pub fn submit(&mut self, state: &State) -> Result<()> {
@@ -952,13 +1127,13 @@ impl Backend {
                 error.get_or_insert(e);
             }
             if !present(id)
-                && let Err(e) = remove_node(id, SWD_HARDWARE)
+                && let Err(e) = remove_node(id, SWD_HARDWARE, None)
             {
                 error.get_or_insert(e);
             }
         }
         if self.root {
-            match remove_root() {
+            match remove_root(self.transport.as_ref()) {
                 Ok(()) => self.root = false,
                 Err(e) => {
                     error.get_or_insert(e);
@@ -983,6 +1158,24 @@ impl Backend {
         } else {
             false
         };
+        if self.identity && !self.root && companion_gone && error.is_none() {
+            let result = (|| {
+                if let Some(key) = Key::open(IDENTITY)? {
+                    if key.snapshot()? != identity_entry() {
+                        return Err(io::Error::other("identity entry changed; preserving it"));
+                    }
+                    drop(key);
+                    status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(IDENTITY).as_ptr()) })?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => self.identity = false,
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
+            }
+        }
         if self.config && !self.root && companion_gone && error.is_none() {
             let result = (|| {
                 if let Some(key) = Key::open(CONFIG)? {
@@ -1003,7 +1196,7 @@ impl Backend {
                 }
             }
         }
-        if self.journal && !self.config && !self.root && companion_gone {
+        if self.journal && !self.config && !self.identity && !self.root && companion_gone {
             let result = (|| {
                 let Some(key) = Key::open(JOURNAL)? else {
                     return Ok(false);
@@ -1027,7 +1220,7 @@ impl Backend {
                 }
             }
         }
-        if !self.config && !self.journal && !self.root && companion_gone {
+        if !self.config && !self.identity && !self.journal && !self.root && companion_gone {
             self.lease.take();
         }
         if let Some(e) = error { Err(e) } else { Ok(()) }
@@ -1042,6 +1235,7 @@ impl Drop for Backend {
             || self.lease.is_some()
             || self.root
             || self.config
+            || self.identity
             || self.journal
         {
             let _ = self.cleanup();
@@ -1055,6 +1249,170 @@ mod tests {
 
     thread_local! {
         pub(super) static FAIL_AFTER_HID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static EJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static QUERY_REMOVED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn hid_child_interface() -> Vec<u16> {
+        let guid = GUID::from_u128(0x4d1e55b2_f16f_11cf_88cb_001111000030);
+        let (mut root, mut child) = (0, 0);
+        let mut id = [0u16; 4096];
+        let mut path = [0u16; 4096];
+        unsafe {
+            assert_eq!(
+                CM_Locate_DevNodeW(&mut root, wide(ROOT_ID).as_ptr(), 0),
+                CR_SUCCESS
+            );
+            assert_eq!(CM_Get_Child(&mut child, root, 0), CR_SUCCESS);
+            assert_eq!(
+                CM_Get_Device_IDW(child, id.as_mut_ptr(), id.len() as u32, 0),
+                CR_SUCCESS
+            );
+            assert_eq!(
+                CM_Get_Device_Interface_ListW(
+                    &guid,
+                    id.as_ptr(),
+                    path.as_mut_ptr(),
+                    path.len() as u32,
+                    CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+                ),
+                CR_SUCCESS
+            );
+        }
+        let end = path.iter().position(|&c| c == 0).unwrap();
+        assert_ne!(end, 0, "HID child has no interface");
+        path[..=end].to_vec()
+    }
+
+    #[test]
+    #[ignore = "explicit elevated test removes a HID device another handle holds open"]
+    fn close_ejects_a_held_hid_child() {
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE},
+            Storage::FileSystem::*,
+        };
+        let controller = Backend::create().unwrap();
+        let path = hid_child_interface();
+        // A handle with no read pending and no PnP notification refuses the
+        // removal query, as Steam's does with PlayStation pads.
+        let held = Handle::new(unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        })
+        .unwrap();
+        let raw = held.0 as usize;
+        std::mem::forget(held);
+        // The holder lets go only once the parent has left the device tree,
+        // which a removal query cannot achieve while the handle is open.
+        let holder = std::thread::spawn(move || {
+            let begin = Instant::now();
+            while present(ROOT_ID) && begin.elapsed() < Duration::from_secs(40) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // The holder owns the handle from here on.
+            drop(Handle(raw as _));
+            begin.elapsed()
+        });
+        EJECTED.set(false);
+        QUERY_REMOVED.set(None);
+        let begin = Instant::now();
+        let closed = controller.close();
+        let took = begin.elapsed();
+        let held_for = holder.join().unwrap();
+        println!(
+            "query removed: {:?}; ejected: {}; close: {closed:?} in {took:?}; handle held {held_for:?}",
+            QUERY_REMOVED.get(),
+            EJECTED.get()
+        );
+        assert_eq!(
+            QUERY_REMOVED.get(),
+            Some(false),
+            "the holder did not refuse"
+        );
+        assert!(
+            EJECTED.get(),
+            "the driver did not answer the removal request"
+        );
+        closed.unwrap();
+        assert!(!present(ROOT_ID));
+        // The removal left the identity whole: a new HID child starts on it.
+        let again = Backend::create().unwrap();
+        hid_child_interface();
+        again.close().unwrap();
+    }
+
+    #[test]
+    fn devnodes_carry_the_identity_token() {
+        assert_eq!(ROOT_ID.rsplit('\\').next(), Some(TOKEN));
+        assert_eq!(SWD_ID.rsplit('\\').next(), Some(TOKEN));
+        assert!(IDENTITY.ends_with(&format!(r"\{TOKEN}")));
+    }
+
+    #[test]
+    fn xusb_answers_parse_as_companion_loads_them() {
+        let blob = xusb_answers();
+        let word = |at: usize| u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
+        let half = |at: usize| u16::from_le_bytes([blob[at], blob[at + 1]]) as usize;
+        assert_eq!(word(0) as usize, blob.len());
+        assert!(blob.len() <= 512);
+        assert_eq!(word(4), 4);
+        let count = word(8) as usize;
+        assert!(count <= 8);
+        let arena = 12 + 12 * count;
+        let mut answers = Vec::new();
+        for entry in (12..arena).step_by(12) {
+            let (mode, offset, size) = (half(entry + 6), half(entry + 8), half(entry + 10));
+            assert!(mode <= 1 && size <= 64 && arena + offset + size <= blob.len());
+            answers.push((
+                word(entry),
+                half(entry + 4),
+                &blob[arena + offset..][..size],
+            ));
+        }
+        let capabilities = answers
+            .iter()
+            .find(|a| a.0 == 0x8000_e004 && a.1 == 36)
+            .unwrap()
+            .2;
+        assert_eq!(capabilities.len(), 36);
+        assert_eq!(capabilities[3], 1);
+        assert_eq!(&capabilities[4..10], &[0x0c, 0, 0x5e, 0x04, 0x8e, 0x02]);
+        assert_eq!(capabilities[12], 0);
+        let battery = answers.iter().find(|a| a.0 == 0x8000_e018).unwrap().2;
+        assert_eq!(battery, &[0, 0, 1, 3]);
+    }
+
+    #[test]
+    fn contract_values_match_driver_limits() {
+        let config = configuration();
+        assert!(!config.contains_key("DeviceInstanceId"));
+        let (kind, report_id) = &config["InputReportId"];
+        assert_eq!(*kind, REG_BINARY);
+        assert_eq!(report_id.len(), 5 + DESCRIPTOR.len());
+        assert_eq!(&report_id[..5], &[0, 18, 0, 0, 0]);
+        let (_, features) = &config["FeatureAnswers"];
+        assert_eq!(features.len(), 16);
+        assert_eq!(&features[..8], &[16, 0, 0, 0, 4, 0, 0, 0]);
+        assert_eq!(config["CachedInputReportIds"], (REG_BINARY, Vec::new()));
+    }
+
+    #[test]
+    fn legacy_configuration_is_recoverable() {
+        let id = r"SWD\HIDMAESTRO\HM_RUST_CLIENT_0";
+        let mut legacy = legacy_configuration();
+        assert!(recoverable(&legacy, None));
+        legacy.insert("CompanionInstanceId".into(), (REG_SZ, utf16_bytes(id)));
+        assert!(recoverable(&legacy, Some(id)));
+        let mut mixed = configuration();
+        mixed.insert("DeviceInstanceId".into(), (REG_SZ, utf16_bytes(ROOT_ID)));
+        assert!(!recoverable(&mixed, None));
     }
 
     #[test]
@@ -1386,11 +1744,12 @@ mod tests {
         old.transport.take();
         old.root = false;
         old.config = false;
+        old.identity = false;
         old.journal = false;
         drop(old);
         let recovered = Backend::create();
         if recovered.is_err() {
-            remove_root().unwrap();
+            remove_root(None).unwrap();
             status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(CONFIG).as_ptr()) }).unwrap();
         }
         assert!(recovered.is_ok(), "{:#?}", recovered.err());
@@ -1406,6 +1765,7 @@ mod tests {
         old.transport.take();
         old.root = false;
         old.config = false;
+        old.identity = false;
         old.journal = false;
         drop(old);
         let key = Key::open(CONFIG).unwrap().unwrap();

@@ -119,6 +119,87 @@ impl Drop for Mapping {
     }
 }
 
+// HIDMAESTRO_VERSION_INFO in driver/hm_contract.h of HIDMaestro v2.0.0.
+const VERSION_SIZE: u32 = 64;
+const CONTRACT_PROTOCOL: i32 = 4;
+const REMOVE_PROTOCOL: i32 = 5;
+
+/// The 64-bit FNV-1a hash of the token's UTF-16LE code units (HmIdentityTag).
+pub(super) fn identity_tag(token: &str) -> u64 {
+    token
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+}
+
+struct Version(Mapping);
+impl Version {
+    fn create(sa: &SECURITY_ATTRIBUTES, reuse: bool, tag: u64) -> Result<Self> {
+        let version = Self(Mapping::create(
+            "Global\\HIDMaestroVersion0",
+            VERSION_SIZE,
+            sa,
+            reuse,
+        )?);
+        // The drivers read the configuration under the contract only once
+        // this half names protocol 4 and the devnodes' identity tag. The SDK
+        // version is the HIDMaestro release whose contract this client speaks.
+        unsafe {
+            let view = version.0.view.Value.cast::<u8>();
+            for (offset, value) in [(0, 1), (4, CONTRACT_PROTOCOL), (8, CONTRACT_PROTOCOL)] {
+                view.add(offset).cast::<i32>().write_volatile(value);
+            }
+            for (i, part) in [2u16, 0, 0].into_iter().enumerate() {
+                view.add(12 + 2 * i).cast::<u16>().write_volatile(part);
+            }
+            view.add(48).cast::<u64>().write_volatile(tag);
+        }
+        Ok(version)
+    }
+
+    fn read(&self, offset: usize) -> i32 {
+        // Offsets are 4-byte aligned within the live 64-byte view.
+        let value = unsafe {
+            self.0
+                .view
+                .Value
+                .cast::<u8>()
+                .add(offset)
+                .cast::<i32>()
+                .read_volatile()
+        };
+        // Each driver writes its protocol last; callers read it first, and this
+        // fence orders that read before the fields read after it.
+        fence(Ordering::SeqCst);
+        value
+    }
+
+    fn check(&self, who: &str, protocol: usize, min: usize, error: usize) -> Result<()> {
+        let error = self.read(error);
+        if error != 0 {
+            let value = match (who, error) {
+                ("XUSB companion", 1) => "XusbAnswers".to_owned(),
+                (_, 1) => "FeatureAnswers".to_owned(),
+                (_, 2) => "CachedInputReportIds".to_owned(),
+                (_, 3) => "LiveFeatureReport".to_owned(),
+                (_, error) => format!("value {error}"),
+            };
+            return Err(io::Error::other(format!(
+                "HIDMaestro {who} could not read {value}"
+            )));
+        }
+        let (protocol, min) = (self.read(protocol), self.read(min));
+        if !(min..=protocol).contains(&CONTRACT_PROTOCOL) {
+            return Err(io::Error::other(format!(
+                "HIDMaestro {who} serves protocols {min} to {protocol}; this client speaks {CONTRACT_PROTOCOL}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn event(name: &str, sa: &SECURITY_ATTRIBUTES, reuse: bool) -> Result<Handle> {
     unsafe {
         let h = Handle::new(CreateEventW(sa, 0, 0, wide(name).as_ptr()))?;
@@ -150,8 +231,8 @@ impl Writer {
     fn create(name: &str, sa: &SECURITY_ATTRIBUTES, reuse: bool) -> Result<Self> {
         Ok(Self {
             input: Mapping::create(name, 362, sa, reuse)?,
-            input_event: event(&name.replace("Input", "InputEvent"), sa, reuse)?,
             companion_event: event(&name.replace("Input", "CompanionInputEvent"), sa, reuse)?,
+            input_event: event(&name.replace("Input", "InputEvent"), sa, reuse)?,
             sequence: 0,
         })
     }
@@ -218,6 +299,9 @@ pub(super) struct Transport {
     _output_event: Handle,
     _ack: Mapping,
     _ack_event: Handle,
+    version: Version,
+    remove_event: Handle,
+    removed_event: Handle,
     _pipes: Vec<Handle>,
     _mutex: Handle,
 }
@@ -225,10 +309,10 @@ pub(super) struct Transport {
 impl Transport {
     #[cfg(test)]
     pub fn create() -> Result<Self> {
-        Self::create_with(|| Ok(true))
+        Self::create_with(identity_tag("HM_RUST_CLIENT_TEST"), || Ok(true))
     }
 
-    pub fn create_with(recover: impl FnOnce() -> Result<bool>) -> Result<Self> {
+    pub fn create_with(tag: u64, recover: impl FnOnce() -> Result<bool>) -> Result<Self> {
         let sd = Security::new()?;
         let sa = sd.attributes();
         let mutex = unsafe {
@@ -268,11 +352,15 @@ impl Transport {
                 ))?
             });
         }
-        let writer = Writer::create("Global\\HIDMaestroInput0", &sa, reuse)?;
         let output = Mapping::create("Global\\HIDMaestroOutput0", 8 + 64 * 264, &sa, reuse)?;
         let ack = Mapping::create("Global\\HIDMaestroInputAck0", 16 + 8 * 84, &sa, reuse)?;
         let output_event = event("Global\\HIDMaestroOutputEvent0", &sa, reuse)?;
         let ack_event = event("Global\\HIDMaestroInputAckEvent0", &sa, reuse)?;
+        let remove_event = event("Global\\HIDMaestroRemoveEvent0", &sa, reuse)?;
+        let removed_event = event("Global\\HIDMaestroRemovedEvent0", &sa, reuse)?;
+        let version = Version::create(&sa, reuse, tag)?;
+        // The driver opens the other objects once, when the input event first opens.
+        let writer = Writer::create("Global\\HIDMaestroInput0", &sa, reuse)?;
         Ok(Self {
             writer,
             delegated: false,
@@ -280,9 +368,36 @@ impl Transport {
             _output_event: output_event,
             _ack: ack,
             _ack_event: ack_event,
+            version,
+            remove_event,
+            removed_event,
             _pipes: pipes,
             _mutex: mutex,
         })
+    }
+
+    /// Fails unless the started HID driver read the configuration under protocol 4.
+    pub fn check_driver(&self) -> Result<()> {
+        self.version.check("driver", 20, 36, 56)
+    }
+
+    /// Fails unless the started XUSB companion read its answers under protocol 4.
+    pub fn check_companion(&self) -> Result<()> {
+        self.version.check("XUSB companion", 40, 44, 60)
+    }
+
+    /// Asks a protocol 5 driver to fail its device, which Windows then removes
+    /// with its HID children as an unplugged device, whatever holds them open.
+    pub fn eject(&self) -> bool {
+        if self.version.read(20) < REMOVE_PROTOCOL {
+            return false;
+        }
+        // A stale answer to an earlier request is not this one.
+        unsafe {
+            ResetEvent(self.removed_event.0) != 0
+                && SetEvent(self.remove_event.0) != 0
+                && WaitForSingleObject(self.removed_event.0, 2000) == 0
+        }
     }
 
     pub fn publish(&mut self, frame: &EncodedFrame) -> Result<()> {
@@ -339,6 +454,42 @@ unsafe fn write_frame(view: *mut u8, sequence: &mut u32, frame: &EncodedFrame) {
 mod tests {
     use super::*;
     use crate::{State, report};
+
+    #[test]
+    fn identity_tag_matches_driver_contract() {
+        // Reference values from driver/hm_contract.h.
+        assert_eq!(identity_tag("HM_0000"), 0x1fd0_4891_6b8d_461f);
+        assert_eq!(identity_tag("HM_0123456789ABCDEF"), 0x3b86_f363_4086_d831);
+    }
+
+    #[test]
+    fn version_half_names_contract_and_reads_driver_errors() {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            ..Default::default()
+        };
+        let mapping = Mapping::create(
+            &format!("Local\\HIDMaestroVersionTest{}", std::process::id()),
+            VERSION_SIZE,
+            &sa,
+            false,
+        )
+        .unwrap();
+        let view = mapping.view.Value.cast::<u8>();
+        let version = Version(mapping);
+        assert!(version.check("driver", 20, 36, 56).is_err());
+        unsafe {
+            view.add(36).cast::<i32>().write_volatile(4);
+            view.add(20).cast::<i32>().write_volatile(5);
+        }
+        version.check("driver", 20, 36, 56).unwrap();
+        unsafe { view.add(56).cast::<i32>().write_volatile(1) };
+        let error = version.check("driver", 20, 36, 56).unwrap_err();
+        assert!(error.to_string().contains("FeatureAnswers"));
+        unsafe { view.add(36).cast::<i32>().write_volatile(5) };
+        unsafe { view.add(56).cast::<i32>().write_volatile(0) };
+        assert!(version.check("driver", 20, 36, 56).is_err());
+    }
 
     #[test]
     fn retained_mapping_is_reset_on_reopen() {
@@ -466,7 +617,7 @@ mod tests {
             1
         );
         drop(pipe);
-        assert!(Transport::create_with(|| Ok(false)).is_err());
+        assert!(Transport::create_with(identity_tag("HM_RUST_CLIENT_TEST"), || Ok(false)).is_err());
         assert_eq!(
             unsafe { retained.view.Value.cast::<u8>().add(276).read_volatile() },
             1
