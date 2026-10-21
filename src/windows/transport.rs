@@ -65,8 +65,9 @@ struct Mapping {
 }
 impl Mapping {
     fn from_handle(handle: Handle, size: u32) -> Result<Self> {
-        // MapViewOfFile fails unless the section has at least size bytes;
-        // the owned section handle stays live until the view is unmapped.
+        // A returned view maps size writable bytes, possibly as the zeroed
+        // tail of a smaller section's last page; the owned section handle
+        // stays live until the view is unmapped.
         let view = unsafe {
             MapViewOfFile(
                 handle.0,
@@ -277,14 +278,16 @@ impl Writer {
 
     /// Imports the input section, input event and companion event, in that order.
     ///
-    /// # Safety
-    /// The handles must refer to HIDMaestro's 362-byte input section and its
-    /// events. No other writer may submit until this writer has been dropped,
-    /// including the controller, which publishes neutral when it closes.
-    pub unsafe fn from_handles(handles: [OwnedHandle; 3]) -> Result<Self> {
+    /// Fails unless the first handle is a section that maps 362 writable
+    /// bytes; events of the wrong kind make `submit` fail.
+    ///
+    /// The handles should refer to HIDMaestro's input section and its events,
+    /// and no other writer should submit until this one is dropped, including
+    /// the controller, which publishes neutral when it closes. Otherwise the
+    /// drivers may read torn frames; memory safety does not depend on it.
+    pub fn from_handles(handles: [OwnedHandle; 3]) -> Result<Self> {
         let [input, input_event, companion_event] = handles.map(|h| Handle(h.into_raw_handle()));
         let mapping = Mapping::from_handle(input, 362)?;
-        // The caller guarantees that the previous writer has stopped.
         let sequence = mapping.at::<AtomicU32>(0).load(Ordering::Relaxed);
         if sequence & 1 != 0 {
             return Err(io::Error::other("input writer stopped during publication"));
@@ -501,6 +504,7 @@ fn write_frame(input: &Mapping, sequence: &mut u32, frame: &EncodedFrame) {
 mod tests {
     use super::*;
     use crate::{State, report};
+    use windows_sys::Win32::Foundation::DuplicateHandle;
 
     fn byte(mapping: &Mapping, offset: usize) -> u8 {
         mapping.at::<AtomicU8>(offset).load(Ordering::Relaxed)
@@ -600,8 +604,7 @@ mod tests {
         writer.submit(&State::default()).unwrap();
         let handles = writer.handles().map(|h| h.try_clone_to_owned().unwrap());
         drop(writer);
-        // The original writer is gone and these are its only writable handles.
-        let mut imported = unsafe { Writer::from_handles(handles) }.unwrap();
+        let mut imported = Writer::from_handles(handles).unwrap();
         imported
             .submit(&State {
                 buttons: crate::Buttons::A,
@@ -614,6 +617,61 @@ mod tests {
             assert_eq!(WaitForSingleObject(imported.0.input_event.0, 0), 0);
             assert_eq!(WaitForSingleObject(imported.0.companion_event.0, 0), 0);
         }
+    }
+
+    fn owned(handle: &Handle) -> OwnedHandle {
+        unsafe { BorrowedHandle::borrow_raw(handle.0) }
+            .try_clone_to_owned()
+            .unwrap()
+    }
+
+    #[test]
+    fn import_rejects_what_is_not_a_writable_section() {
+        let sd = Security::new().unwrap();
+        let sa = sd.attributes();
+        let name = |what| format!("Local\\HIDMaestroImport{what}Test{}", std::process::id());
+        let section = Mapping::create(&name("Input"), 362, &sa, false).unwrap();
+        let input = event(&name("InputEvent"), &sa, false).unwrap();
+        let companion = event(&name("Companion"), &sa, false).unwrap();
+        let mut read_only = ptr::null_mut();
+        check(unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                section._handle.0,
+                GetCurrentProcess(),
+                &mut read_only,
+                FILE_MAP_READ,
+                0,
+                0,
+            )
+        })
+        .unwrap();
+        let read_only = Handle(read_only);
+        for wrong in [&input, &read_only] {
+            assert!(
+                Writer::from_handles([owned(wrong), owned(&input), owned(&companion)]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn import_with_wrong_events_fails_to_submit() {
+        let sd = Security::new().unwrap();
+        let sa = sd.attributes();
+        let name = |what| {
+            format!(
+                "Local\\HIDMaestroWrongEvents{what}Test{}",
+                std::process::id()
+            )
+        };
+        let section = Mapping::create(&name("Input"), 362, &sa, false).unwrap();
+        let mut writer = Writer::from_handles([
+            owned(&section._handle),
+            owned(&section._handle),
+            owned(&section._handle),
+        ])
+        .unwrap();
+        assert!(writer.submit(&State::default()).is_err());
     }
 
     #[test]
