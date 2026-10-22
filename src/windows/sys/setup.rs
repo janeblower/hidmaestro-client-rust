@@ -24,6 +24,7 @@ fn info() -> SP_DEVINFO_DATA {
 
 impl DeviceSet {
     pub fn new() -> Result<Self> {
+        // SAFETY: no class and no parent window are passed.
         let h = unsafe { SetupDiCreateDeviceInfoList(ptr::null(), ptr::null_mut()) };
         if h == -1 {
             Err(io::Error::last_os_error())
@@ -34,6 +35,7 @@ impl DeviceSet {
 
     pub fn open(&self, id: &str) -> Result<DeviceInfo<'_>> {
         let mut data = info();
+        // SAFETY: the set is open, the ID outlives the call, and data has its cbSize set.
         check(unsafe {
             SetupDiOpenDeviceInfoW(self.0, wide(id).as_ptr(), ptr::null_mut(), 0, &mut data)
         })?;
@@ -42,6 +44,8 @@ impl DeviceSet {
 
     pub fn create(&self, id: &str, class: &GUID, description: &str) -> Result<DeviceInfo<'_>> {
         let mut data = info();
+        // SAFETY: the set is open, the strings outlive the call, and data has
+        // its cbSize set.
         check(unsafe {
             SetupDiCreateDeviceInfoW(
                 self.0,
@@ -58,6 +62,7 @@ impl DeviceSet {
 }
 impl Drop for DeviceSet {
     fn drop(&mut self) {
+        // SAFETY: DeviceSet owns the list, and every DeviceInfo borrowing it is gone.
         unsafe {
             SetupDiDestroyDeviceInfoList(self.0);
         }
@@ -74,6 +79,7 @@ impl DeviceInfo<'_> {
         let mut buffer = vec![0u8; 1024];
         let mut size = 0;
         let mut kind = 0;
+        // SAFETY: data belongs to the set, and the buffer holds the length passed.
         check(unsafe {
             SetupDiGetDeviceRegistryPropertyW(
                 self.set.0,
@@ -90,6 +96,7 @@ impl DeviceInfo<'_> {
     }
 
     pub fn set_property(&mut self, property: u32, bytes: &[u8]) -> Result<()> {
+        // SAFETY: data belongs to the set, and the call reads bytes.len() bytes.
         check(unsafe {
             SetupDiSetDeviceRegistryPropertyW(
                 self.set.0,
@@ -102,6 +109,7 @@ impl DeviceInfo<'_> {
     }
 
     pub fn call_class_installer(&self, function: u32) -> Result<()> {
+        // SAFETY: data belongs to the set.
         check(unsafe { SetupDiCallClassInstaller(function, self.set.0, &self.data) })
     }
 
@@ -113,6 +121,7 @@ impl DeviceInfo<'_> {
             cbSize: size_of::<SP_DEVINSTALL_PARAMS_W>() as u32,
             ..Default::default()
         };
+        // SAFETY: data belongs to the set, and params has its cbSize set.
         check(unsafe { SetupDiGetDeviceInstallParamsW(set, &self.data, &mut params) })?;
         params.Flags |= DI_ENUMSINGLEINF | DI_QUIETINSTALL;
         let path = wide(&inf.to_string_lossy());
@@ -120,21 +129,26 @@ impl DeviceInfo<'_> {
             return Err(io::Error::other("INF path is too long"));
         }
         params.DriverPath[..path.len()].copy_from_slice(&path);
+        // SAFETY: as above; DriverPath holds the NUL-terminated INF path.
         check(unsafe { SetupDiSetDeviceInstallParamsW(set, &self.data, &params) })?;
+        // SAFETY: data belongs to the set; the list is destroyed below.
         check(unsafe { SetupDiBuildDriverInfoList(set, &mut self.data, SPDIT_COMPATDRIVER) })?;
         let mut driver = SP_DRVINFO_DATA_V2_W {
             cbSize: size_of::<SP_DRVINFO_DATA_V2_W>() as u32,
             ..Default::default()
         };
         let mut reboot = 0;
+        // SAFETY: the driver list was built above, and driver has its cbSize set.
         let mut rc =
             unsafe { SetupDiEnumDriverInfoW(set, &self.data, SPDIT_COMPATDRIVER, 0, &mut driver) };
         if rc != 0 {
+            // SAFETY: driver was just enumerated from the list of this element.
             rc = unsafe {
                 DiInstallDevice(ptr::null_mut(), set, &self.data, &driver, 0, &mut reboot)
             };
         }
         let error = io::Error::last_os_error();
+        // SAFETY: the list was built above, and no driver from it is used after.
         unsafe {
             SetupDiDestroyDriverInfoList(set, &self.data, SPDIT_COMPATDRIVER);
         }

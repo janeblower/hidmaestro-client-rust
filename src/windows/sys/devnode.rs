@@ -8,6 +8,7 @@ pub struct DevNode(pub(super) u32);
 impl DevNode {
     pub fn locate(id: &str, flags: u32) -> Result<Self, CONFIGRET> {
         let mut node = 0;
+        // SAFETY: the ID outlives the call.
         match unsafe { CM_Locate_DevNodeW(&mut node, wide(id).as_ptr(), flags) } {
             CR_SUCCESS => Ok(Self(node)),
             rc => Err(rc),
@@ -17,6 +18,7 @@ impl DevNode {
     /// The node's status and problem flags.
     pub fn status(self) -> Result<(u32, u32), CONFIGRET> {
         let (mut state, mut problem) = (0, 0);
+        // SAFETY: both outputs are writable u32s.
         match unsafe { CM_Get_DevNode_Status(&mut state, &mut problem, self.0, 0) } {
             CR_SUCCESS => Ok((state, problem)),
             rc => Err(rc),
@@ -31,6 +33,7 @@ impl DevNode {
 
     pub fn child(self) -> Result<Self, CONFIGRET> {
         let mut child = 0;
+        // SAFETY: child is a writable u32.
         match unsafe { CM_Get_Child(&mut child, self.0, 0) } {
             CR_SUCCESS => Ok(Self(child)),
             rc => Err(rc),
@@ -39,6 +42,7 @@ impl DevNode {
 
     pub fn sibling(self) -> Result<Self, CONFIGRET> {
         let mut sibling = 0;
+        // SAFETY: sibling is a writable u32.
         match unsafe { CM_Get_Sibling(&mut sibling, self.0, 0) } {
             CR_SUCCESS => Ok(Self(sibling)),
             rc => Err(rc),
@@ -47,6 +51,7 @@ impl DevNode {
 
     pub fn id(self) -> Result<String, CONFIGRET> {
         let mut id = [0u16; 4096];
+        // SAFETY: the buffer holds the length passed.
         match unsafe { CM_Get_Device_IDW(self.0, id.as_mut_ptr(), id.len() as u32, 0) } {
             CR_SUCCESS => {
                 let end = id.iter().position(|&c| c == 0).unwrap_or(id.len());
@@ -59,6 +64,7 @@ impl DevNode {
 
     /// Asks the holders of the subtree to let go and removes it; false if refused.
     pub fn query_and_remove(self) -> bool {
+        // SAFETY: no veto outputs are requested.
         let rc = unsafe {
             CM_Query_And_Remove_SubTreeW(
                 self.0,
@@ -75,6 +81,7 @@ impl DevNode {
 /// The first present interface of a class on a device, with its NUL.
 pub fn interface(class: &GUID, id: &str) -> Option<Vec<u16>> {
     let mut list = vec![0u16; 4096];
+    // SAFETY: the ID outlives the call, and the buffer holds the length passed.
     let rc = unsafe {
         CM_Get_Device_Interface_ListW(
             class,
