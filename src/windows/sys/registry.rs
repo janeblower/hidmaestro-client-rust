@@ -11,6 +11,7 @@ pub struct Key(HKEY);
 impl Key {
     pub fn open(path: &str) -> Result<Option<Self>> {
         let mut key = ptr::null_mut();
+        // SAFETY: the path outlives the call; key receives a handle that Key closes.
         let rc = unsafe {
             RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
@@ -31,6 +32,7 @@ impl Key {
     pub fn create(path: &str) -> Result<Self> {
         let mut key = ptr::null_mut();
         let mut disposition = 0;
+        // SAFETY: the path outlives the call; key receives a handle that Key closes.
         let rc = unsafe {
             RegCreateKeyExW(
                 HKEY_LOCAL_MACHINE,
@@ -57,12 +59,14 @@ impl Key {
 
     /// Deletes the key at path and everything below it.
     pub fn delete_tree(path: &str) -> Result<()> {
+        // SAFETY: the path outlives the call.
         status(unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(path).as_ptr()) })
     }
 
     /// Reads every value, failing if the key has subkeys.
     pub fn snapshot(&self) -> Result<BTreeMap<String, (u32, Vec<u8>)>> {
         let mut subkeys = 0;
+        // SAFETY: the key is open; only the subkey count is requested.
         status(unsafe {
             RegQueryInfoKeyW(
                 self.0,
@@ -88,6 +92,7 @@ impl Key {
         for index in 0.. {
             let mut name = [0u16; 256];
             let mut len = name.len() as u32;
+            // SAFETY: name holds len UTF-16 units, which the call reads back into len.
             let rc = unsafe {
                 RegEnumValueW(
                     self.0,
@@ -115,6 +120,7 @@ impl Key {
     }
 
     pub fn set(&self, name: &str, kind: u32, bytes: &[u8]) -> Result<()> {
+        // SAFETY: name and bytes outlive the call, which reads bytes.len() bytes.
         status(unsafe {
             RegSetValueExW(
                 self.0,
@@ -138,6 +144,7 @@ impl Key {
     pub fn get(&self, name: &str) -> Result<Option<(u32, Vec<u8>)>> {
         let mut size = 0;
         let mut kind = 0;
+        // SAFETY: the name outlives the call; a null buffer asks only for the size.
         let rc = unsafe {
             RegQueryValueExW(
                 self.0,
@@ -153,7 +160,7 @@ impl Key {
         }
         status(rc)?;
         let mut bytes = vec![0; size as usize];
-        // The buffer holds size bytes, which the call reads back into size.
+        // SAFETY: the buffer holds size bytes, which the call reads back into size.
         status(unsafe {
             RegQueryValueExW(
                 self.0,
@@ -169,11 +176,13 @@ impl Key {
     }
 
     pub fn delete_value(&self, name: &str) -> Result<()> {
+        // SAFETY: the name outlives the call.
         status(unsafe { RegDeleteValueW(self.0, wide(name).as_ptr()) })
     }
 }
 impl Drop for Key {
     fn drop(&mut self) {
+        // SAFETY: Key owns the open key and closes it only here.
         unsafe {
             RegCloseKey(self.0);
         }

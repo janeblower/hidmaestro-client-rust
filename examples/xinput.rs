@@ -9,7 +9,7 @@ fn main() -> std::io::Result<()> {
 
     fn read(slot: u32) -> Option<XINPUT_STATE> {
         let mut state = XINPUT_STATE::default();
-        // The buffer is initialized and lives through this synchronous call.
+        // SAFETY: the buffer is initialized and lives through this synchronous call.
         (unsafe { XInputGetState(slot, &mut state) } == 0).then_some(state)
     }
     fn wait(mut condition: impl FnMut() -> bool, message: &str) -> io::Result<()> {

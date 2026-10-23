@@ -15,9 +15,10 @@ pub struct SoftwareDevice {
 }
 impl Drop for SoftwareDevice {
     fn drop(&mut self) {
+        // SAFETY: the handle is owned and closed only here. SwDeviceClose joins
+        // callbacks before _callback is freed:
+        // https://learn.microsoft.com/windows/win32/api/swdevice/nf-swdevice-swdeviceclose
         unsafe {
-            // SwDeviceClose joins callbacks before _callback is freed:
-            // https://learn.microsoft.com/windows/win32/api/swdevice/nf-swdevice-swdeviceclose
             SwDeviceClose(self.handle);
         }
     }
@@ -29,20 +30,20 @@ unsafe extern "system" fn created(
     context: *const std::ffi::c_void,
     id: *const u16,
 ) {
-    // SoftwareDevice keeps the boxed context alive until SwDeviceClose joins us.
+    // SAFETY: SoftwareDevice keeps the boxed context alive until SwDeviceClose joins us.
     let callback = unsafe { &*context.cast::<Callback>() };
     let mut len = 0;
     if !id.is_null() {
-        // Windows supplies a NUL-terminated ID valid for this callback.
-        unsafe {
-            while *id.add(len) != 0 {
-                len += 1;
-            }
+        // SAFETY: Windows supplies a NUL-terminated ID valid for this callback,
+        // and the scan stops at its NUL.
+        while unsafe { *id.wrapping_add(len) } != 0 {
+            len += 1;
         }
     }
     let id = if len == 0 {
         String::new()
     } else {
+        // SAFETY: the scan above found len units before the NUL.
         String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(id, len) })
     };
     let _ = callback.sender.send((result, id));
@@ -83,7 +84,8 @@ impl SoftwareDevice {
         let (tx, rx) = mpsc::channel();
         let context = Box::new(Callback { sender: tx });
         let mut handle = ptr::null_mut();
-        // SwDeviceCreate copies create-info; the boxed callback address is stable.
+        // SAFETY: SwDeviceCreate copies create-info; the boxed callback address
+        // is stable and lives until SwDeviceClose.
         let hr = unsafe {
             SwDeviceCreate(
                 wide(device.enumerator).as_ptr(),
@@ -137,6 +139,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let context = Box::new(Callback { sender: tx });
         assert!(rx.recv_timeout(Duration::from_millis(1)).is_err());
+        // SAFETY: context outlives the call, and a null ID is allowed.
         unsafe {
             created(
                 ptr::null_mut(),
@@ -153,6 +156,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<(i32, String)>();
         let context = Box::new(Callback { sender: tx });
         let id = wide(r"SWD\HIDMAESTRO\decorated-instance");
+        // SAFETY: context and the NUL-terminated ID outlive the call.
         unsafe {
             created(
                 ptr::null_mut(),

@@ -9,8 +9,8 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-        LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::{
         Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, GetTokenInformation,
@@ -30,7 +30,7 @@ fn owned(raw: HANDLE) -> Result<OwnedHandle> {
     if raw.is_null() || raw == INVALID_HANDLE_VALUE {
         Err(io::Error::last_os_error())
     } else {
-        // The call returned a fresh handle that nothing else owns.
+        // SAFETY: the call returned a fresh handle that nothing else owns.
         Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     }
 }
@@ -44,12 +44,18 @@ fn open_named(raw: HANDLE) -> Result<Option<OwnedHandle>> {
     }
 }
 
+/// Whether the create call just made on this thread opened an existing object.
+fn already_exists() -> bool {
+    io::Error::last_os_error().raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32)
+}
+
 /// A security descriptor for the named objects this client creates.
 pub struct Security(*mut std::ffi::c_void);
 impl Security {
     pub fn new(sddl: &str) -> Result<Self> {
         let mut sd = ptr::null_mut();
-        // Windows allocates sd; Security releases it with LocalFree.
+        // SAFETY: the SDDL string lives through the call; Windows allocates sd,
+        // which Security releases with LocalFree.
         check(unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 wide(sddl).as_ptr(),
@@ -63,6 +69,7 @@ impl Security {
 }
 impl Drop for Security {
     fn drop(&mut self) {
+        // SAFETY: Windows allocated self.0 in new for LocalFree, called only here.
         unsafe {
             LocalFree(self.0);
         }
@@ -84,6 +91,7 @@ fn with_attributes<T>(
 
 /// Waits up to `ms` for the handle; false on timeout.
 pub fn wait(handle: BorrowedHandle<'_>, ms: u32) -> Result<bool> {
+    // SAFETY: the handle is borrowed, so it stays open for the call.
     match unsafe { WaitForSingleObject(handle.as_raw_handle(), ms) } {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
@@ -96,13 +104,15 @@ pub fn wait(handle: BorrowedHandle<'_>, ms: u32) -> Result<bool> {
 #[cfg(test)]
 pub fn duplicate(handle: BorrowedHandle<'_>, access: u32) -> Result<OwnedHandle> {
     use windows_sys::Win32::Foundation::DuplicateHandle;
+    // SAFETY: returns a pseudo-handle that needs no closing.
+    let process = unsafe { GetCurrentProcess() };
     let mut target = ptr::null_mut();
-    // The source is borrowed for the call; target receives a new handle.
+    // SAFETY: the source is borrowed for the call; target receives a new handle.
     check(unsafe {
         DuplicateHandle(
-            GetCurrentProcess(),
+            process,
             handle.as_raw_handle(),
-            GetCurrentProcess(),
+            process,
             &mut target,
             access,
             0,
@@ -117,24 +127,27 @@ impl Event {
     /// Creates or opens a named event; true when it already existed.
     pub fn create(name: &str, security: Option<&Security>, manual: bool) -> Result<(Self, bool)> {
         let name = wide(name);
-        // Attributes and name outlive the call; the error code is read right after it.
-        let (handle, existed) = with_attributes(security, |sa| unsafe {
-            let handle = CreateEventW(sa, manual.into(), 0, name.as_ptr());
-            (handle, GetLastError() == ERROR_ALREADY_EXISTS)
+        let (handle, existed) = with_attributes(security, |sa| {
+            // SAFETY: attributes and name outlive the call.
+            let handle = unsafe { CreateEventW(sa, manual.into(), 0, name.as_ptr()) };
+            (handle, already_exists())
         });
         Ok((Self(owned(handle)?), existed))
     }
 
     pub fn open(name: &str, access: u32) -> Result<Option<Self>> {
         let name = wide(name);
+        // SAFETY: the name outlives the call.
         Ok(open_named(unsafe { OpenEventW(access, 0, name.as_ptr()) })?.map(Self))
     }
 
     pub fn set(&self) -> Result<()> {
+        // SAFETY: the event handle is owned by self and open.
         check(unsafe { SetEvent(self.0.as_raw_handle()) })
     }
 
     pub fn reset(&self) -> Result<()> {
+        // SAFETY: the event handle is owned by self and open.
         check(unsafe { ResetEvent(self.0.as_raw_handle()) })
     }
 
@@ -158,10 +171,15 @@ impl From<OwnedHandle> for Event {
 /// Implementors must be atomics, since `Mapping::at` hands out shared
 /// references into memory that other processes write.
 pub unsafe trait Shared {}
+// SAFETY: an atomic, which tolerates concurrent writers.
 unsafe impl Shared for AtomicU8 {}
+// SAFETY: an atomic, which tolerates concurrent writers.
 unsafe impl Shared for AtomicU16 {}
+// SAFETY: an atomic, which tolerates concurrent writers.
 unsafe impl Shared for AtomicI32 {}
+// SAFETY: an atomic, which tolerates concurrent writers.
 unsafe impl Shared for AtomicU32 {}
+// SAFETY: an atomic, which tolerates concurrent writers.
 unsafe impl Shared for AtomicU64 {}
 
 /// A read-write view of a section, accessed only through atomics.
@@ -171,14 +189,15 @@ pub struct Mapping {
     handle: OwnedHandle,
 }
 
-// The view is only reached through atomics, so sharing it across threads is
-// no different from sharing it with the other processes that map it.
+// SAFETY: the view is only reached through atomics, so sharing it across
+// threads is no different from sharing it with the other processes that map it.
 unsafe impl Send for Mapping {}
+// SAFETY: as for Send.
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
     pub fn from_handle(handle: OwnedHandle, size: u32) -> Result<Self> {
-        // A returned view maps size writable bytes, possibly as the zeroed
+        // SAFETY: a returned view maps size writable bytes, possibly as the zeroed
         // tail of a smaller section's last page; the owned section handle
         // stays live until the view is unmapped.
         let view = unsafe {
@@ -210,17 +229,19 @@ impl Mapping {
     ) -> Result<(Self, bool)> {
         let path = name;
         let name = wide(name);
-        // Attributes and name outlive the call; the error code is read right after it.
-        let (handle, existed) = with_attributes(security, |sa| unsafe {
-            let handle = CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                sa,
-                PAGE_READWRITE,
-                0,
-                size,
-                name.as_ptr(),
-            );
-            (handle, GetLastError() == ERROR_ALREADY_EXISTS)
+        let (handle, existed) = with_attributes(security, |sa| {
+            // SAFETY: attributes and name outlive the call.
+            let handle = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    sa,
+                    PAGE_READWRITE,
+                    0,
+                    size,
+                    name.as_ptr(),
+                )
+            };
+            (handle, already_exists())
         });
         let handle = owned(handle)?;
         if existed && !reuse {
@@ -235,6 +256,7 @@ impl Mapping {
     /// Opens an existing named section for reading.
     pub fn open(name: &str) -> Result<Option<OwnedHandle>> {
         let name = wide(name);
+        // SAFETY: the name outlives the call.
         open_named(unsafe { OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr()) })
     }
 
@@ -256,7 +278,7 @@ impl Mapping {
             .wrapping_add(offset)
             .cast::<T>();
         assert!(ptr.is_aligned());
-        // The view lives as long as self and the bounds are checked. Other
+        // SAFETY: the view lives as long as self and the bounds are checked. Other
         // mappings of the section change it behind our back, which atomics
         // permit; no reference to plain data in the view is ever created.
         unsafe { &*ptr }
@@ -264,7 +286,7 @@ impl Mapping {
 }
 impl Drop for Mapping {
     fn drop(&mut self) {
-        // References from at borrow self, so none outlive the view.
+        // SAFETY: references from at borrow self, so none outlive the view.
         unsafe {
             UnmapViewOfFile(self.view);
         }
@@ -274,10 +296,10 @@ impl Drop for Mapping {
 /// Creates or opens a named mutex without acquiring it; true when it already existed.
 pub fn create_mutex(name: &str, security: Option<&Security>) -> Result<(OwnedHandle, bool)> {
     let name = wide(name);
-    // Attributes and name outlive the call; the error code is read right after it.
-    let (handle, existed) = with_attributes(security, |sa| unsafe {
-        let handle = CreateMutexW(sa, 0, name.as_ptr());
-        (handle, GetLastError() == ERROR_ALREADY_EXISTS)
+    let (handle, existed) = with_attributes(security, |sa| {
+        // SAFETY: attributes and name outlive the call.
+        let handle = unsafe { CreateMutexW(sa, 0, name.as_ptr()) };
+        (handle, already_exists())
     });
     Ok((owned(handle)?, existed))
 }
@@ -291,7 +313,7 @@ pub fn create_pipe(name: &str, first: bool, security: Option<&Security>) -> Resu
         } else {
             0
         };
-    // Attributes and name outlive the call.
+    // SAFETY: attributes and name outlive the call.
     let handle = with_attributes(security, |sa| unsafe {
         CreateNamedPipeW(
             name.as_ptr(),
@@ -309,11 +331,16 @@ pub fn create_pipe(name: &str, first: bool, security: Option<&Security>) -> Resu
 
 /// Whether this process runs with an elevated token.
 pub fn elevated() -> Result<bool> {
+    // SAFETY: returns a pseudo-handle that needs no closing.
+    let process = unsafe { GetCurrentProcess() };
     let mut token = ptr::null_mut();
-    check(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) })?;
+    // SAFETY: token receives a new handle, which owned takes over.
+    check(unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) })?;
     let token = owned(token)?;
     let mut elevation = TOKEN_ELEVATION::default();
     let mut size = 0;
+    // SAFETY: the buffer is a TOKEN_ELEVATION of the size passed, and the
+    // token is open for querying.
     check(unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
@@ -336,6 +363,7 @@ pub fn poll_xinput() {
 /// The buttons of a connected XInput slot.
 pub fn xinput_buttons(slot: u32) -> Option<u16> {
     let mut state = XINPUT_STATE::default();
+    // SAFETY: state is a writable XINPUT_STATE.
     (unsafe { XInputGetState(slot, &mut state) } == 0).then_some(state.Gamepad.wButtons)
 }
 
@@ -356,6 +384,7 @@ mod device_file {
     /// Opens a NUL-terminated device interface path.
     pub fn open_device(path: &[u16]) -> Result<OwnedHandle> {
         assert_eq!(path.last(), Some(&0));
+        // SAFETY: the path is NUL-terminated, as asserted, and outlives the call.
         owned(unsafe {
             CreateFileW(
                 path.as_ptr(),
@@ -382,7 +411,7 @@ mod device_file {
         } else {
             input.as_ptr().cast()
         };
-        // Both buffers live through the synchronous call with their lengths.
+        // SAFETY: both buffers live through the synchronous call with their lengths.
         check(unsafe {
             DeviceIoControl(
                 device.as_raw_handle(),

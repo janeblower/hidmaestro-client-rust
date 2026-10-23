@@ -1,5 +1,9 @@
 // Win32 calls live behind safe wrappers in windows::sys, the only exception.
-#![deny(unsafe_code)]
+#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block
+)]
 
 // HIDMaestro ships x64 drivers, and a 32-bit process would see redirected registry keys.
 #[cfg(all(windows, not(target_arch = "x86_64")))]
